@@ -1,0 +1,10 @@
+{
+  "metastore_mysql": {
+    "host": "192.168.18.143",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore",
+    "hive_database": "gmall"
+  }
+}
