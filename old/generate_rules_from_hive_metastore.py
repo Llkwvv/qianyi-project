@@ -4,36 +4,17 @@
 根据 Hive 元数据自动生成 rules.generated.json
 
 功能：
-- 直连 Hive Metastore 所在的 MySQL，一次性读取指定库下所有表和字段类型；
+- 直连 Hive Metastore 所在的 MySQL，一次性读取所有库下所有表和字段类型；
 - 为每张表生成一条规则：
   - metrics 固定包含 row_count；
   - 对所有 decimal / numeric 类型字段生成 sum(metric) 指标；
   - 不生成 keys（主键去重校验不做）。
-- 所有配置从 config.json 文件中读取，避免硬编码；
-- 自动从元数据中读取分区列和 decimal 配置，无需手动配置；
-- 支持命令行参数和配置文件两种方式配置测试模式。
+- Metastore 连接配置从 config.json 文件读取，避免硬编码；
+- 自动从元数据中读取分区列和 decimal 配置，无需手动配置。
 
-使用示例（最简）：
-  python generate_rules_from_hive.py \
+使用示例：
+  python generate_rules_from_hive_metastore.py \
     --output rules.generated.json
-
-使用示例（指定测试模式）：
-  # 测试所有表（默认）
-  python generate_rules_from_hive.py \
-    --output rules.generated.json \
-    --test-mode all
-
-  # 仅测试指定表（可接受多个表名）
-  python generate_rules_from_hive.py \
-    --output rules.generated.json \
-    --test-mode selected \
-    --include-tables gmall.dim_activity_full gmall.dim_coupon_full
-
-  # 排除特定表
-  python generate_rules_from_hive.py \
-    --output rules.generated.json \
-    --test-mode excluded \
-    --exclude-tables gmall.ads_page_path gmall.tmp_dim_date_info
 
 依赖：
 - PyMySQL（通过 Metastore MySQL 获取字段时）
@@ -108,39 +89,16 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Output JSON path"
     )
-    parser.add_argument(
-        "--test-mode",
-        choices=["all", "selected", "excluded"],
-        default="all",
-        help="Test mode: 'all' (default), 'selected', or 'excluded'"
-    )
-    parser.add_argument(
-        "--include-tables",
-        nargs="*",
-        default=[],
-        help="List of table names to include (only used in 'selected' mode)"
-    )
-    parser.add_argument(
-        "--exclude-tables",
-        nargs="*",
-        default=[],
-        help="List of table names to exclude (only used in 'excluded' mode)"
-    )
-    parser.add_argument(
-        "--default-where",
-        default="dt='${biz_date}'",
-        help="Default where clause template, default \"dt='${biz_date}'\""
-    )
     return parser.parse_args()
 
 
 def get_partition_columns_from_metastore_mysql(
-    host: str, port: int, user: str, password: str, db: str,
-    database_name: str, table_name: str
+    config: Config,
+    database_name: str,
+    table_name: str
 ) -> list:
     """
     从 Hive Metastore 中获取表的分区列信息。
-
     """
     if pymysql is None:
         print(
@@ -148,6 +106,12 @@ def get_partition_columns_from_metastore_mysql(
             file=sys.stderr,
         )
         sys.exit(1)
+
+    host = config.get_required("metastore_mysql.host")
+    port = config.get_required("metastore_mysql.port")
+    user = config.get_required("metastore_mysql.user")
+    password = config.get_required("metastore_mysql.password")
+    db = config.get_required("metastore_mysql.db")
 
     conn = pymysql.connect(
         host=host,
@@ -196,10 +160,9 @@ def get_decimal_precision_and_scale(type_str: str) -> tuple:
     return 18, 2
 
 
-def get_columns_from_metastore_mysql(config: Config) -> dict:
+def get_all_databases(config: Config) -> list:
     """
-    直接从 Hive Metastore 所在的 MySQL 中一次性查询指定库下所有表的列信息。
-
+    从 Hive Metastore MySQL 中获取所有数据库列表。
     """
     if pymysql is None:
         print(
@@ -213,7 +176,50 @@ def get_columns_from_metastore_mysql(config: Config) -> dict:
     user = config.get_required("metastore_mysql.user")
     password = config.get_required("metastore_mysql.password")
     db = config.get_required("metastore_mysql.db")
-    database_name = config.get_required("metastore_mysql.hive_database")
+
+    conn = pymysql.connect(
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=db,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.Cursor,
+    )
+
+    sql = """SELECT NAME FROM DBS ORDER BY NAME"""
+
+    databases = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            for (db_name,) in cur.fetchall():
+                d = (db_name or "").strip()
+                if d:
+                    databases.append(d)
+    finally:
+        conn.close()
+
+    return databases
+
+
+def get_columns_from_metastore_mysql(config: Config) -> dict:
+    """
+    直接从 Hive Metastore 所在的 MySQL 中一次性查询所有库下所有表的列信息。
+    返回格式: {(database, table): [ColumnInfo, ...], ...}
+    """
+    if pymysql is None:
+        print(
+            "ERROR: pymysql 未安装，请先安装：pip install pymysql",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    host = config.get_required("metastore_mysql.host")
+    port = config.get_required("metastore_mysql.port")
+    user = config.get_required("metastore_mysql.user")
+    password = config.get_required("metastore_mysql.password")
+    db = config.get_required("metastore_mysql.db")
 
     conn = pymysql.connect(
         host=host,
@@ -226,6 +232,7 @@ def get_columns_from_metastore_mysql(config: Config) -> dict:
     )
 
     sql = """SELECT
+      d.NAME,
       t.TBL_NAME,
       c.COLUMN_NAME,
       c.TYPE_NAME
@@ -233,21 +240,22 @@ def get_columns_from_metastore_mysql(config: Config) -> dict:
     JOIN DBS d ON t.DB_ID = d.DB_ID
     JOIN SDS s ON t.SD_ID = s.SD_ID
     JOIN COLUMNS_V2 c ON s.CD_ID = c.CD_ID
-    WHERE d.NAME = %s
-    ORDER BY t.TBL_NAME, c.INTEGER_IDX
+    ORDER BY d.NAME, t.TBL_NAME, c.INTEGER_IDX
     """
 
     columns_by_table = {}
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (database_name,))
-            for tbl_name, col_name, type_name in cur.fetchall():
+            cur.execute(sql)
+            for db_name, tbl_name, col_name, type_name in cur.fetchall():
+                db = (db_name or "").strip()
                 t = (tbl_name or "").strip()
                 c = (col_name or "").strip()
                 dt = (type_name or "").strip().lower()
-                if not t or not c:
+                if not db or not t or not c:
                     continue
-                columns_by_table.setdefault(t, []).append(
+                key = (db, t)
+                columns_by_table.setdefault(key, []).append(
                     ColumnInfo(name=c, type=dt)
                 )
     finally:
@@ -260,27 +268,14 @@ def build_table_rule(
     config: Config,
     database: str,
     table: str,
-    columns: list,
-    default_where: str,
-    test_mode: str,
-    include_tables: List[str],
-    exclude_tables: List[str]
+    columns: list
 ) -> Dict:
     full_name = f"{database}.{table}"
 
-    # 确定是否启用该表测试（基于测试模式）
-    should_test = True
-    if test_mode == "selected":
-        if full_name not in include_tables:
-            should_test = False
-    elif test_mode == "excluded":
-        if full_name in exclude_tables:
-            should_test = False
-
-    # 构建表规则：如果不应测试，则只设置 enabled=False
+    # 构建表规则
     rule = {
         "table": full_name,
-        "enabled": should_test,
+        "enabled": True,
         "partition_cols": [],
         "keys": [],
         "metrics": [
@@ -291,21 +286,14 @@ def build_table_rule(
         ]
     }
 
-    # 获取分区列（如果需要）
-    if "${biz_date}" in default_where and should_test:
-        try:
-            host = config.get_required("metastore_mysql.host")
-            port = config.get_required("metastore_mysql.port")
-            user = config.get_required("metastore_mysql.user")
-            password = config.get_required("metastore_mysql.password")
-            db = config.get_required("metastore_mysql.db")
-            partition_cols = get_partition_columns_from_metastore_mysql(
-                host, port, user, password, db, database, table
-            )
-            rule["partition_cols"] = partition_cols
-        except Exception as e:
-            print(f"WARNING: 获取分区列信息失败，将使用默认条件: {e}", file=sys.stderr)
-            # 失败时不设置 partition_cols
+    # 获取分区列
+    try:
+        partition_cols = get_partition_columns_from_metastore_mysql(
+            config, database, table
+        )
+        rule["partition_cols"] = partition_cols
+    except Exception as e:
+        print(f"WARNING: 获取分区列信息失败: {e}", file=sys.stderr)
 
     # 为 decimal/numeric 字段添加 sum metrics
     for col in columns:
@@ -330,25 +318,33 @@ def main() -> None:
 
     # 必需配置
     output_path = args.output
-    test_mode = args.test_mode
-    include_tables = args.include_tables
-    exclude_tables = args.exclude_tables
-    default_where = args.default_where
+
+    # 从 Metastore MySQL 获取所有库的数据库列表
+    try:
+        databases = get_all_databases(config)
+        print(
+            f"Loaded databases from Metastore MySQL: "
+            f"databases={len(databases)}"
+        )
+    except Exception as e:
+        print(
+            f"ERROR: 从 Metastore MySQL 获取数据库列表失败，原因：{e!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # 从 Metastore MySQL 获取列信息
     columns_by_table = {}
     try:
         columns_by_table = get_columns_from_metastore_mysql(config)
         if columns_by_table:
-            database_name = config.get_required("metastore_mysql.hive_database")
             print(
                 f"Loaded table metadata from Metastore MySQL: "
-                f"database={database_name}, tables={len(columns_by_table)}"
+                f"tables={len(columns_by_table)}"
             )
         else:
-            database_name = config.get_required("metastore_mysql.hive_database")
             print(
-                f"No tables found in Metastore for database={database_name}",
+                f"No tables found in Metastore",
                 file=sys.stderr,
             )
     except Exception as e:  # noqa: BLE001
@@ -360,36 +356,32 @@ def main() -> None:
 
     table_rules = []
 
-    # 只处理指定数据库中的表（这里假设处理数据库中的所有表）
+    # 处理所有库中的所有表
     target_tables = sorted(columns_by_table.keys())
 
-    print(f"Generating rules for database={config.get_required('metastore_mysql.hive_database')}, tables={len(target_tables)}")
+    print(f"Generating rules for {len(target_tables)} tables across {len(databases)} databases")
 
-    for t in target_tables:
-        cols = columns_by_table.get(t)
+    for db, tbl in target_tables:
+        cols = columns_by_table.get((db, tbl))
         if not cols:
-            print(f"Skipping table without metadata: {t}", file=sys.stderr)
+            print(f"Skipping table without metadata: {db}.{tbl}", file=sys.stderr)
             continue
 
         # 构建表规则
         rule = build_table_rule(
             config=config,
-            database=config.get_required("metastore_mysql.hive_database"),
-            table=t,
-            columns=cols,
-            default_where=default_where,
-            test_mode=test_mode,
-            include_tables=include_tables,
-            exclude_tables=exclude_tables
+            database=db,
+            table=tbl,
+            columns=cols
         )
         table_rules.append(rule)
 
-    # 生成最终的配置对象，并加入测试配置部分
+    # 生成最终的配置对象
     output_config = {
         "mode": {
             "include_all": True,
-            "exclude_tables": exclude_tables,
-            "selected_tables": include_tables
+            "exclude_tables": [],
+            "selected_tables": []
         },
         "tables": table_rules
     }
