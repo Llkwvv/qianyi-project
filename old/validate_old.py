@@ -1,27 +1,24 @@
 """
 Old cluster validation CLI (PyHive).
 
-Reads JSON rules, executes Hive SQL, and exports CSV summary.
+Reads JSON rules, executes Hive SQL in batches with concurrency,
+writes to Hive table first, then exports CSV summary.
+
 Example:
-  python old/validate_old.py --config old/rules.generated.json --env old/env.yml --run-id run_001 --biz-date 2026-03-05
-  python old/validate_old.py --env old/env.yml --init-schema --init-only --run-id init_001
+  python old/validate_old.py --config /tmp/test_rules.json --env old/env_config.json --run-id run_001 --biz-date 2026-03-05
+  python old/validate_old.py --config /tmp/test_rules.json --env old/env_config.json --init-schema --init-only --run-id init_001
 """
 
 import argparse
 import csv
 import hashlib
+import json
 import os
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
-
-try:
-    import yaml  # Still needed for env.yml
-    import json  # For rules file
-except ImportError:
-    print("Please install pyyaml first: pip install -r old/requirements.txt")
-    sys.exit(1)
-
 
 def escape_sql_string(text: str) -> str:
     return text.replace("'", "''")
@@ -31,19 +28,32 @@ def generate_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
-def load_yaml(path: str) -> Dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
 def load_json(path: str) -> Dict:
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        lines = f.readlines()
+
+    # Remove // comments
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip comment-only lines
+        if stripped.startswith('//'):
+            continue
+        # Remove inline // comments
+        if '//' in line:
+            idx = line.find('//')
+            before = line[:idx].rstrip()
+            if before:
+                cleaned_lines.append(before)
+        else:
+            cleaned_lines.append(line.rstrip())
+
+    return json.loads('\n'.join(cleaned_lines))
 
 
 def load_env(path: str) -> Dict:
-    data = load_yaml(path)
-    return data or {}
+    """Load environment config from JSON."""
+    return load_json(path)
 
 
 def get_cluster_env(env: Dict, name: Optional[str] = None) -> Dict:
@@ -53,75 +63,88 @@ def get_cluster_env(env: Dict, name: Optional[str] = None) -> Dict:
     return env.get("hive") or {}
 
 
+def filter_tables(config: dict) -> List[dict]:
+    """Filter tables based on mode settings."""
+    tables = config.get("tables", [])
+    mode = config.get("mode", {})
+
+    include_all = mode.get("include_all", True)
+    exclude_tables = set(mode.get("exclude_tables", []))
+    selected_tables = set(mode.get("selected_tables", []))
+
+    if not include_all:
+        # White-list mode: only selected_tables
+        return [t for t in tables if t.get("enabled", True) and f"{t['table']}" in selected_tables]
+    else:
+        # Include all mode: exclude excluded_tables
+        return [t for t in tables if t.get("enabled", True) and f"{t['table']}" not in exclude_tables]
+
+
 def build_summary_sql(
-    config: dict,
+    table: dict,
     run_id: str,
     biz_date: str = None,
-    include_run_id: bool = True,
+    default_where: str = "1=1",
 ) -> str:
-    tables = config.get("tables", [])
-    default_where = config.get("global", {}).get("default_where", "1=1")
+    """Build SQL for a single table."""
+    t = table
+    table_name = t["table"]
+    where = t.get("where", default_where)
+    partition_cols = t.get("partition_cols", [])
+
+    if partition_cols:
+        if biz_date:
+            where = where.replace("${biz_date}", biz_date)
+    else:
+        if "${biz_date}" in where or where == default_where:
+            where = "1=1"
+
+    keys = t.get("keys", [])
+    metrics = t.get("metrics", [])
+
+    where_hash = generate_hash(where)
+    where_escaped = escape_sql_string(where)
+    partition_spec_expr = _build_partition_spec_expr(partition_cols)
+    group_by_sql = _build_group_by_sql(partition_cols)
 
     parts: List[str] = []
-    for t in tables:
-        if not t.get("enabled", True):
-            continue
 
-        table = t["table"]
-        where = t.get("where", default_where)
-        partition_cols = t.get("partition_cols", [])
-        if partition_cols:
-            if biz_date:
-                where = where.replace("${biz_date}", biz_date)
-        else:
-            if "${biz_date}" in where or where == default_where:
-                where = "1=1"
-        keys = t.get("keys", [])
-        metrics = t.get("metrics", [])
+    for m in metrics:
+        name, expr = m["name"], m["expr"]
+        expr_escaped = escape_sql_string(expr)
+        select_cols = [
+            f"'{table_name}' as table_name",
+            "'metric' as check_type",
+            f"'{name}' as metric_name",
+            f"'{expr_escaped}' as metric_expr",
+            f"cast({expr} as string) as value",
+            f"'{where_escaped}' as where_clause",
+            f"'{where_hash}' as where_hash",
+            f"{partition_spec_expr} as partition_spec",
+            "current_timestamp() as computed_at",
+            f"'{run_id}' as run_id",
+        ]
+        parts.append(
+            f"SELECT {', '.join(select_cols)} FROM {table_name} WHERE {where}{group_by_sql}"
+        )
 
-        where_hash = generate_hash(where)
-        where_escaped = escape_sql_string(where)
-        partition_spec_expr = _build_partition_spec_expr(partition_cols)
-        group_by_sql = _build_group_by_sql(partition_cols)
-
-        for m in metrics:
-            name, expr = m["name"], m["expr"]
-            expr_escaped = escape_sql_string(expr)
-            select_cols = [
-                f"'{table}' as table_name",
-                "'metric' as check_type",
-                f"'{name}' as metric_name",
-                f"'{expr_escaped}' as metric_expr",
-                f"cast({expr} as string) as value",
-                f"'{where_escaped}' as where_clause",
-                f"'{where_hash}' as where_hash",
-                f"{partition_spec_expr} as partition_spec",
-                "current_timestamp() as computed_at",
-            ]
-            if include_run_id:
-                select_cols.insert(0, f"'{run_id}' as run_id")
-            parts.append(
-                f"SELECT {', '.join(select_cols)} FROM {table} WHERE {where}{group_by_sql}"
-            )
-
-        if keys:
-            keys_expr = ", ".join(keys)
-            select_cols = [
-                f"'{table}' as table_name",
-                "'pk_dup' as check_type",
-                "'pk_dup_count' as metric_name",
-                f"'count(*) - count(distinct {keys_expr})' as metric_expr",
-                f"cast(count(*) - count(distinct {keys_expr}) as string) as value",
-                f"'{where_escaped}' as where_clause",
-                f"'{where_hash}' as where_hash",
-                f"{partition_spec_expr} as partition_spec",
-                "current_timestamp() as computed_at",
-            ]
-            if include_run_id:
-                select_cols.insert(0, f"'{run_id}' as run_id")
-            parts.append(
-                f"SELECT {', '.join(select_cols)} FROM {table} WHERE {where}{group_by_sql}"
-            )
+    if keys:
+        keys_expr = ", ".join(keys)
+        select_cols = [
+            f"'{table_name}' as table_name",
+            "'pk_dup' as check_type",
+            "'pk_dup_count' as metric_name",
+            f"'count(*) - count(distinct {keys_expr})' as metric_expr",
+            f"cast(count(*) - count(distinct {keys_expr}) as string) as value",
+            f"'{where_escaped}' as where_clause",
+            f"'{where_hash}' as where_hash",
+            f"{partition_spec_expr} as partition_spec",
+            "current_timestamp() as computed_at",
+            f"'{run_id}' as run_id",
+        ]
+        parts.append(
+            f"SELECT {', '.join(select_cols)} FROM {table_name} WHERE {where}{group_by_sql}"
+        )
 
     return "\nUNION ALL\n".join(parts)
 
@@ -144,6 +167,24 @@ def apply_hive_settings(cursor, settings) -> None:
         cursor.execute(f"set {setting}")
 
 
+def check_kerberos_ticket() -> bool:
+    """Check if user has valid Kerberos ticket."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["klist"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        # If klist succeeds and shows valid tickets, return True
+        if result.returncode == 0 and "Valid" in result.stdout:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def build_hive_connect_candidates(
     host: str,
     port: int,
@@ -163,11 +204,21 @@ def build_hive_connect_candidates(
     }
 
     candidates: List[Dict] = []
+
+    # Check for Kerberos authentication
     if auth == "AUTO":
-        # Match the simplest verified form first: hive.connect(host, port, username, database)
+        if check_kerberos_ticket():
+            print("Kerberos ticket found, using GSSAPI auth")
+            candidates.append({**base_kwargs, "auth": "GSSAPI"})
+        # Also try other methods
         candidates.append({**base_kwargs})
         candidates.append({**base_kwargs, "auth": "NOSASL"})
         candidates.append({**base_kwargs, "auth": "NONE"})
+    elif auth == "KERBEROS":
+        if check_kerberos_ticket():
+            candidates.append({**base_kwargs, "auth": "GSSAPI"})
+        else:
+            raise RuntimeError("Kerberos auth requested but no valid ticket found. Run 'kinit' first.")
     else:
         connect_kwargs = {**base_kwargs, "auth": auth}
         if auth in {"LDAP", "CUSTOM"} and password:
@@ -210,9 +261,9 @@ CREATE TABLE IF NOT EXISTS {db}.old_summary (
   where_clause STRING,
   where_hash STRING,
   partition_spec STRING,
-  computed_at TIMESTAMP
+  computed_at TIMESTAMP,
+  run_id STRING
 )
-PARTITIONED BY (run_id STRING)
 STORED AS ORC
 """.strip(),
         f"""
@@ -225,9 +276,9 @@ CREATE TABLE IF NOT EXISTS {db}.new_summary (
   where_clause STRING,
   where_hash STRING,
   partition_spec STRING,
-  computed_at TIMESTAMP
+  computed_at TIMESTAMP,
+  run_id STRING
 )
-PARTITIONED BY (run_id STRING)
 STORED AS ORC
 """.strip(),
         f"""
@@ -241,9 +292,9 @@ CREATE TABLE IF NOT EXISTS {db}.compare_result (
   new_value STRING,
   diff DOUBLE,
   reason STRING,
-  compared_at TIMESTAMP
+  compared_at TIMESTAMP,
+  run_id STRING
 )
-PARTITIONED BY (run_id STRING)
 STORED AS ORC
 """.strip(),
         f"""
@@ -302,6 +353,50 @@ def init_schema(
             time.sleep(retry_wait)
 
 
+def execute_batch(
+    sql: str,
+    connect_candidates: List[Dict],
+    hive_settings,
+    retries: int,
+    retry_wait: int,
+    batch_num: int,
+    lock: threading.Lock,
+    table_name: str = None,
+) -> tuple:
+    """Execute a batch SQL and return (columns, rows)."""
+    try:
+        from pyhive import hive
+    except ImportError:
+        print("Please install pyhive first: pip install pyhive[hive]")
+        sys.exit(1)
+
+    attempt = 0
+    while True:
+        try:
+            conn, _ = open_hive_connection(hive, connect_candidates)
+            cursor = conn.cursor()
+            apply_hive_settings(cursor, hive_settings)
+
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+
+            cursor.close()
+            conn.close()
+
+            with lock:
+                print(f"Table {table_name}: fetched {len(rows)} rows")
+            return columns, rows
+
+        except Exception as exc:
+            attempt += 1
+            with lock:
+                print(f"[ERROR] Table {table_name} failed: {exc}")
+            if attempt > retries:
+                raise
+            time.sleep(retry_wait)
+
+
 def run_hive(
     sql: str,
     output: str,
@@ -310,7 +405,7 @@ def run_hive(
     retries: int,
     retry_wait: int,
 ) -> None:
-    """Execute Hive SQL and write CSV output."""
+    """Execute Hive SQL and write CSV output (for dry-run or small queries)."""
     try:
         from pyhive import hive
     except ImportError:
@@ -352,9 +447,9 @@ def run_hive(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Old cluster validation (PyHive)")
-    parser.add_argument("--config", default="old/rules.generated.yml", help="YAML rules file")
-    parser.add_argument("--env", default="old/env.yml", help="Env config file")
-    parser.add_argument("--run-id", default="run_001", help="Run ID")
+    parser.add_argument("--config", required=True, help="JSON rules file")
+    parser.add_argument("--env", default="old/env_config.json", help="Env config file (JSON)")
+    parser.add_argument("--run-id", required=True, help="Run ID")
     parser.add_argument("--biz-date", help="Business date")
     parser.add_argument("--output", help="Output CSV path")
     parser.add_argument("--db", help="Validation DB override")
@@ -375,6 +470,8 @@ def main() -> None:
     )
     parser.add_argument("--retries", type=int, default=0, help="Retry count on failure")
     parser.add_argument("--retry-wait", type=int, default=3, help="Retry wait seconds")
+    parser.add_argument("--threads", type=int, default=10, help="Number of concurrent threads")
+    parser.add_argument("--batch-size", type=int, default=50, help="Number of tables per UNION ALL batch")
     args = parser.parse_args()
 
     invalid_settings = [s for s in args.hive_set if "=" not in s]
@@ -391,7 +488,7 @@ def main() -> None:
     output = args.output or env.get("paths", {}).get("old_summary") or "output/old_summary.csv"
 
     if not host or not port or not username:
-        print("Missing Hive connection info. Please set host/port/username in old/env.yml.")
+        print("Missing Hive connection info. Please set host/port/username in env config.")
         sys.exit(2)
     connect_candidates = build_hive_connect_candidates(host, port, username, cluster_env, args)
 
@@ -406,29 +503,83 @@ def main() -> None:
         if args.init_only:
             return
 
-    if not args.config:
-        print("Missing --config. Please provide rules YAML file.")
-        sys.exit(2)
+    # Load rules from JSON
+    config = load_json(args.config)
 
-    with open(args.config, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    # Filter tables based on mode
+    tables = filter_tables(config)
+    default_where = config.get("global", {}).get("default_where", "1=1")
 
-    sql = build_summary_sql(config, args.run_id, args.biz_date, include_run_id=True)
-    print(f"Generated SQL with {sql.count('SELECT')} queries")
+    print(f"Total tables to process: {len(tables)}")
+    print(f"Concurrency: {args.threads} threads")
 
     if args.dry_run:
-        print(sql)
+        for i, t in enumerate(tables):
+            sql = build_summary_sql(t, args.run_id, args.biz_date, default_where)
+            print(f"\n=== Table {i + 1}: {t['table']} ===")
+            print(sql)
         return
 
+    # Create thread lock for printing
+    lock = threading.Lock()
+
+    # Execute tables in parallel (one SQL per table)
+    start_time = time.time()
+    all_rows = []
+    columns = None
+    failed_tables = []
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {}
+        for i, t in enumerate(tables):
+            sql = build_summary_sql(t, args.run_id, args.biz_date, default_where)
+            future = executor.submit(
+                execute_batch,
+                sql,
+                connect_candidates,
+                args.hive_set,
+                args.retries,
+                args.retry_wait,
+                i + 1,
+                lock,
+                t["table"],
+            )
+            futures[future] = t["table"]
+
+        # Wait for all to complete and collect results
+        for future in as_completed(futures):
+            table_name = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    batch_columns, batch_rows = result
+                    all_rows.extend(batch_rows)
+                    if columns is None:
+                        columns = batch_columns
+            except Exception as exc:
+                print(f"[ERROR] Table {table_name} failed: {exc}")
+                failed_tables.append(table_name)
+                raise
+
+    elapsed = time.time() - start_time
+    print(f"All batches completed in {elapsed:.2f} seconds, total rows: {len(all_rows)}")
+
+    # Write to CSV directly
+    print("Writing to CSV...")
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-    run_hive(
-        sql,
-        output,
-        connect_candidates,
-        args.hive_set,
-        args.retries,
-        args.retry_wait,
-    )
+
+    # Use default columns if not set
+    if columns is None:
+        columns = ["table_name", "check_type", "metric_name", "metric_expr", "value",
+                   "where_clause", "where_hash", "partition_spec", "computed_at", "run_id"]
+
+    with open(output, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for row in all_rows:
+            writer.writerow(row)
+
+    print(f"Wrote {len(all_rows)} rows to {output}")
     print("Done")
 
 
