@@ -134,27 +134,19 @@ def open_hive_connection(hive, connect_candidates: List[Dict]):
     raise RuntimeError(f"All Hive auth attempts failed. Details: {details}")
 
 
-def execute_batch(
+def execute_batch_with_connection(
     sql: str,
-    connect_candidates: List[Dict],
+    conn,
     hive_settings,
     retries: int,
     retry_wait: int,
-    batch_num: int,
     lock: threading.Lock,
     name: str = None,
 ) -> tuple:
-    """Execute a batch SQL and return (columns, rows)."""
-    try:
-        from pyhive import hive
-    except ImportError:
-        print("Please install pyhive first: pip install pyhive[hive]")
-        sys.exit(1)
-
+    """Execute a batch SQL using existing connection, return (columns, rows)."""
     attempt = 0
     while True:
         try:
-            conn, _ = open_hive_connection(hive, connect_candidates)
             cursor = conn.cursor()
             apply_hive_settings(cursor, hive_settings)
 
@@ -162,8 +154,7 @@ def execute_batch(
             rows = cursor.fetchall()
             columns = [desc[0] for desc in cursor.description]
 
-            cursor.close()
-            conn.close()
+            # 不关闭 cursor 和连接，复用！
 
             with lock:
                 print(f"{name}: fetched {len(rows)} rows")
@@ -172,10 +163,42 @@ def execute_batch(
         except Exception as exc:
             attempt += 1
             with lock:
-                print(f"[ERROR] {name} failed: {exc}")
+                print(f"[ERROR] {name} failed (attempt {attempt}): {exc}")
             if attempt > retries:
                 raise
             time.sleep(retry_wait)
+
+
+def create_reused_connections(hive, connect_candidates: List[Dict], num_threads: int, lock: threading.Lock):
+    """Pre-create connections for reuse across threads."""
+    connections = []
+    for i in range(num_threads):
+        try:
+            conn, auth = open_hive_connection(hive, connect_candidates)
+            connections.append(conn)
+            with lock:
+                print(f"Created connection {i+1}/{num_threads} (auth: {auth})")
+        except Exception as exc:
+            with lock:
+                print(f"[ERROR] Failed to create connection {i+1}: {exc}")
+            # Close already created connections
+            for c in connections:
+                try:
+                    c.close()
+                except:
+                    pass
+            raise RuntimeError(f"Failed to create connections: {exc}")
+    return connections
+
+
+def close_connections(connections: List):
+    """Close all pre-created connections."""
+    for i, conn in enumerate(connections):
+        try:
+            conn.close()
+            print(f"Closed connection {i+1}/{len(connections)}")
+        except Exception as exc:
+            print(f"[WARN] Failed to close connection {i+1}: {exc}")
 
 
 def main() -> None:
@@ -252,25 +275,38 @@ def main() -> None:
             print(sql)
         return
 
+    # Import hive here (lazy load)
+    try:
+        from pyhive import hive
+    except ImportError:
+        print("Please install pyhive first: pip install pyhive[hive]")
+        sys.exit(1)
+
     # Create thread lock for printing
     lock = threading.Lock()
 
-    # Execute SQL in parallel
+    # Pre-create connections for reuse
+    print(f"Creating {args.threads} persistent connections...")
+    connections = create_reused_connections(hive, connect_candidates, args.threads, lock)
+
+    # Execute SQL in parallel, each thread reuses its assigned connection
     start_time = time.time()
     all_rows = []
     columns = None
 
+    # Assign connection index to each task (round-robin)
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = {}
         for i, (name, sql) in enumerate(sql_tasks):
+            conn_idx = i % args.threads  # 轮询分配连接
+            conn = connections[conn_idx]
             future = executor.submit(
-                execute_batch,
+                execute_batch_with_connection,
                 sql,
-                connect_candidates,
+                conn,
                 args.hive_set,
                 args.retries,
                 args.retry_wait,
-                i + 1,
                 lock,
                 name,
             )
@@ -289,6 +325,9 @@ def main() -> None:
             except Exception as exc:
                 print(f"[ERROR] {name} failed: {exc}")
                 raise
+
+    # Close all connections
+    close_connections(connections)
 
     elapsed = time.time() - start_time
     print(f"All batches completed in {elapsed:.2f} seconds, total rows: {len(all_rows)}")
