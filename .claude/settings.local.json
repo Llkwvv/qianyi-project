@@ -2,7 +2,21 @@
   "permissions": {
     "allow": [
       "Bash(curl -o python-3.13.2-amd64.exe \"https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe\")",
-      "Bash(curl -L --retry 3 -o python-3.13.2-amd64.exe \"https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe\")"
+      "Bash(curl -L --retry 3 -o python-3.13.2-amd64.exe \"https://www.python.org/ftp/python/3.13.2/python-3.13.2-amd64.exe\")",
+      "Bash(cd:*)",
+      "Bash(python:*)",
+      "Bash(D:/桌面/qianyi-project/.venv-3.6.15/Scripts/python -c \"from pyhive import hive; print\\('pyhive installed'\\)\")",
+      "Bash(\"D:/桌面/qianyi-project/.venv-3.6.15/bin/python\" -c \"from pyhive import hive; print\\('pyhive installed'\\)\")",
+      "Bash(d:/work/python/python -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(\"D:/桌面/qianyi-project/.venv-3.6.15/bin/python3.6\" -c \"from pyhive import hive; print\\('pyhive installed'\\)\")",
+      "Bash(\"D:/桌面/qianyi-project/.venv/Scripts/python\" --version)",
+      "Read(//d/work/**)",
+      "Bash(ls /c/Python*)",
+      "Bash(pyenv versions:*)",
+      "Bash(ssh hadoop102:*)",
+      "Bash(rsync:*)",
+      "Bash(scp:*)",
+      "Bash(git add:*)"
     ]
   }
 }
