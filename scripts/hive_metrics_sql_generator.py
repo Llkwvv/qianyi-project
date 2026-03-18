@@ -396,8 +396,9 @@ def get_columns_for_tables(config: Config, table_list: List[Tuple[str, str]]) ->
         cursorclass=pymysql.cursors.Cursor,
     )
 
-    # Build query for specific tables
-    placeholders = ','.join(['%s'] * len(table_list))
+    # Build query for specific tables - each (db, table) pair needs its own placeholder tuple
+    num_tables = len(table_list)
+    placeholders = ','.join(['(%s,%s)'] * num_tables)
     sql = f"""SELECT
       d.NAME,
       t.TBL_NAME,
@@ -407,7 +408,7 @@ def get_columns_for_tables(config: Config, table_list: List[Tuple[str, str]]) ->
     JOIN DBS d ON t.DB_ID = d.DB_ID
     JOIN SDS s ON t.SD_ID = s.SD_ID
     JOIN COLUMNS_V2 c ON s.CD_ID = c.CD_ID
-    WHERE (d.NAME, t.TBL_NAME) IN (({placeholders}))
+    WHERE (d.NAME, t.TBL_NAME) IN ({placeholders})
     ORDER BY d.NAME, t.TBL_NAME, c.INTEGER_IDX
     """
 
