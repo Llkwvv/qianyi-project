@@ -10,40 +10,38 @@ except ImportError:
     print("ERROR: 请安装 PyMySQL: pip install pymysql")
     sys.exit(1)
 
-def build_insert_sql(table_name, metrics, partition_cols, data_dt, config_file):
+def build_select_sql(table_name, metrics, partition_cols, data_dt, config_file):
     metric_selects = [f"cast({m['expr']} as string) as {m['name']}" for m in metrics]
     select_cols = [f"'{table_name}' as table_name"]
     select_cols.extend(metric_selects)
-    select_cols.extend(partition_cols)
 
+    # 直接将分区字段作为 partition_spec 字段，不重复添加原始分区字段
     if partition_cols:
-        partition_expr = "concat_ws('/', " + ", ".join([f"concat('{pc}=', cast({pc} as string))" for pc in partition_cols]) + ")"
+        # 为分区字段添加别名，作为 partition_spec
+        partition_selects = [f"{pc} as partition_spec" for pc in partition_cols]
+        select_cols.extend(partition_selects)
     else:
-        partition_expr = "''"
-    select_cols.append(f"{partition_expr} as partition_spec")
+        select_cols.append("'' as partition_spec")
+
     select_cols.append("current_timestamp() as computed_at")
     select_cols.append(f"'{data_dt}' as data_dt")
 
-    select_sql = f"SELECT {', '.join(select_cols)} FROM {table_name} WHERE 1=1"
+    select_sql = f"SELECT {', '.join(select_cols)} FROM {table_name}"
 
-    with open(config_file, "r") as f:
-        config = json.load(f)
-    validation_db = config.get("validation_db", "validation_db")
-
-    return f"INSERT INTO TABLE {validation_db}.old_summary {select_sql}"
+    return select_sql
 
 def generate_sql_file(table_rules, data_dt, config_file, output_dir="output"):
     os.makedirs(output_dir, exist_ok=True)
     sql_statements = []
 
     for rule in table_rules:
-        sql = build_insert_sql(rule["table"], rule["metrics"], rule["partition_cols"], data_dt, config_file)
+        sql = build_select_sql(rule["table"], rule["metrics"], rule["partition_cols"], data_dt, config_file)
         sql_statements.append(sql)
 
     sql_file = os.path.join(output_dir, "metrics_queries.sql")
     with open(sql_file, "w") as f:
         f.write(f"-- Data Date: {data_dt}\n")
-        f.write(f"-- Total INSERT statements: {len(sql_statements)}\n\n")
+        f.write(f"-- Total SELECT statements: {len(sql_statements)}\n\n")
         for sql in sql_statements:
             f.write(sql + ";\n")
 
@@ -107,27 +105,96 @@ def build_table_rule(config_file, database, table, columns):
         "partition_cols": [],
         "metrics": [{"name": "row_count", "expr": "count(1)"}]
     }
+
+    # 从配置文件中获取分区列（如果有的话）
     try:
-        rule["partition_cols"] = get_partition_columns(config_file, database, table)
+        with open(config_file, "r") as f:
+            config = json.load(f)
+        # 这里需要修改以支持从增强版JSON中获取分区列
+        # 为了简化，我们暂时使用从Metastore获取的方式
+        try:
+            rule["partition_cols"] = get_partition_columns(config_file, database, table)
+        except:
+            pass
     except:
         pass
+
     for col in columns:
-        if col["type"].startswith("decimal") or col["type"].startswith("numeric"):
-            precision, scale = get_decimal_precision_and_scale(col["type"])
-            metric_name = f"{col['name']}_sum"
-            expr = f"sum(cast({col['name']} as decimal({precision},{scale})))"
-            rule["metrics"].append({"name": metric_name, "expr": expr})
+        # 优先检查字段类型（来自Metastore）
+        if "type" in col:
+            if col["type"].startswith("decimal") or col["type"].startswith("numeric"):
+                precision, scale = get_decimal_precision_and_scale(col["type"])
+                metric_name = f"{col['name']}_sum"
+                expr = f"sum(cast({col['name']} as decimal({precision},{scale})))"
+                rule["metrics"].append({"name": metric_name, "expr": expr})
+        else:
+            # 如果没有类型信息，但字段名包含数值相关的关键词，则作为数值字段处理
+            col_name = col["name"].lower()
+            if any(keyword in col_name for keyword in ["amount", "price", "value", "count", "num", "qty", "sum"]):
+                metric_name = f"{col['name']}_sum"
+                expr = f"sum({col['name']})"
+                rule["metrics"].append({"name": metric_name, "expr": expr})
     return rule
 
 def load_table_list(path):
     tables = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#') and '.' in line:
-                db, tbl = line.split('.', 1)
-                tables.append((db.strip(), tbl.strip()))
+        # 支持 JSON 格式输入
+        try:
+            data = json.load(f)
+            if "tables" in data:
+                for table_info in data["tables"]:
+                    if "name" in table_info and "." in table_info["name"]:
+                        db, tbl = table_info["name"].split('.', 1)
+                        tables.append((db.strip(), tbl.strip()))
+        except json.JSONDecodeError:
+            # 如果不是 JSON 格式，则回退到原来的文本格式
+            f.seek(0)
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '.' in line:
+                    db, tbl = line.split('.', 1)
+                    tables.append((db.strip(), tbl.strip()))
     return tables
+
+def get_table_columns_from_json(path, table_list):
+    """从增强版 JSON 文件中获取字段信息"""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    columns_by_table = {}
+    partition_cols_by_table = {}
+
+    # 遍历所有表
+    for table_info in data["tables"]:
+        table_name = table_info["name"]
+        if "." in table_name:
+            db, tbl = table_name.split('.', 1)
+
+            # 检查是否是我们需要的表
+            if (db, tbl) in table_list:
+                # 获取分区列
+                partition_cols = table_info.get("partition_cols", [])
+                partition_cols_by_table[(db, tbl)] = partition_cols
+
+                fields = table_info.get("fields", [])
+                column_list = []
+                for field in fields:
+                    if isinstance(field, dict):
+                        # 增强版 JSON 格式，包含字段类型
+                        column_list.append({
+                            "name": field["name"],
+                            "type": field.get("type", "")
+                        })
+                    else:
+                        # 简单字段名格式
+                        column_list.append({
+                            "name": field,
+                            "type": ""
+                        })
+                columns_by_table[(db, tbl)] = column_list
+
+    return columns_by_table, partition_cols_by_table
 
 def main():
     parser = argparse.ArgumentParser()
@@ -138,11 +205,24 @@ def main():
     args = parser.parse_args()
 
     tables = load_table_list(args.table_list)
-    columns_by_table = get_table_columns(args.config, tables)
+
+    # 尝试使用增强版 JSON 处理方式
+    try:
+        columns_by_table, partition_cols_by_table = get_table_columns_from_json(args.table_list, tables)
+    except:
+        # 如果失败，回退到原有的数据库方式
+        columns_by_table = get_table_columns(args.config, tables)
+        partition_cols_by_table = {}
+
     rules = []
     for db, tbl in sorted(columns_by_table.keys()):
         cols = columns_by_table[(db, tbl)]
         rule = build_table_rule(args.config, db, tbl, cols)
+
+        # 如果从JSON中获得了分区列信息，则使用它
+        if (db, tbl) in partition_cols_by_table:
+            rule["partition_cols"] = partition_cols_by_table[(db, tbl)]
+
         rules.append(rule)
 
     generate_sql_file(rules, args.data_dt, args.config, args.output_dir)
