@@ -9,6 +9,7 @@
   - metrics 固定包含 row_count；
   - 对所有 decimal / numeric 类型字段生成 sum(metric) 指标；
   - 不生成 keys（主键去重校验不做）。
+- 支持从JSON配置文件读取表列表和字段信息
 - Metastore 连接配置从 config.json 文件读取，避免硬编码；
 - 自动从元数据中读取分区列和 decimal 配置，无需手动配置。
 - 生成的 SQL 使用 INSERT INTO 写入结果表，每个 metric 一条语句，用分号分隔。
@@ -17,6 +18,11 @@
   # 指定表列表文件生成 SQL
   python hive_rules_sql_generator.py \
     --table-list tables.txt \
+    --data-dt 2024-01-01
+
+  # 指定JSON配置文件生成 SQL
+  python hive_rules_sql_generator.py \
+    --table-list test_tables.json \
     --data-dt 2024-01-01
 
   # 不指定表列表则处理所有表
@@ -585,6 +591,47 @@ def load_table_list(path: str) -> List[Tuple[str, str]]:
     return tables
 
 
+def load_table_list_from_json(path: str) -> List[Tuple[str, str]]:
+    """
+    从JSON配置文件加载表名列表
+    返回: [(database, table), ...]
+    """
+    try:
+        with open(path, 'r', encoding="utf-8") as f:
+            data = json.load(f)
+
+        tables = []
+        if "tables" in data:
+            for table_info in data["tables"]:
+                table_name = table_info["name"]
+                if '.' in table_name:
+                    db, tbl = table_name.split('.', 1)
+                    tables.append((db.strip(), tbl.strip()))
+        return tables
+    except Exception as e:
+        print(f"WARNING: 从JSON文件加载表列表失败: {e}", file=sys.stderr)
+        return []
+
+
+def get_fields_from_json(path: str, table_name: str) -> List[str]:
+    """
+    从JSON配置文件获取特定表的字段列表
+    返回: [field1, field2, ...] 或 [] 如果未找到
+    """
+    try:
+        with open(path, 'r', encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "tables" in data:
+            for table_info in data["tables"]:
+                if table_info["name"] == table_name and "fields" in table_info:
+                    return table_info["fields"]
+        return []
+    except Exception as e:
+        print(f"WARNING: 从JSON文件获取字段信息失败: {e}", file=sys.stderr)
+        return []
+
+
 def main() -> None:
     # 解析命令行参数
     args = parse_args()
@@ -599,8 +646,14 @@ def main() -> None:
     try:
         # 如果指定了 --table-list，从列表中只获取指定的表
         if args.table_list:
-            target_table_list = load_table_list(args.table_list)
-            print(f"Loading tables from list file: {args.table_list}, count={len(target_table_list)}")
+            # 检查是否为JSON文件
+            if args.table_list.endswith('.json'):
+                target_table_list = load_table_list_from_json(args.table_list)
+                print(f"Loading tables from JSON file: {args.table_list}, count={len(target_table_list)}")
+            else:
+                target_table_list = load_table_list(args.table_list)
+                print(f"Loading tables from list file: {args.table_list}, count={len(target_table_list)}")
+
             columns_by_table = get_columns_for_tables(config, target_table_list)
             databases = list(set(db for db, _ in target_table_list))
             print(
@@ -656,12 +709,28 @@ def main() -> None:
             print(f"Skipping table without metadata: {db}.{tbl}", file=sys.stderr)
             continue
 
+        # 检查是否有JSON配置文件并获取字段信息
+        json_fields = []
+        if args.table_list and args.table_list.endswith('.json'):
+            full_table_name = f"{db}.{tbl}"
+            json_fields = get_fields_from_json(args.table_list, full_table_name)
+
+        # 如果JSON中有字段定义，则使用JSON中的字段；否则使用MySQL元数据
+        if json_fields:
+            # 创建仅包含JSON中指定字段的列信息
+            filtered_cols = [col for col in cols if col.name in json_fields]
+            print(f"Using {len(filtered_cols)} fields from JSON config for {full_table_name}")
+        else:
+            # 使用所有从MySQL获取的字段
+            filtered_cols = cols
+            print(f"Using all {len(filtered_cols)} fields from MySQL metadata for {db}.{tbl}")
+
         # 构建表规则
         rule = build_table_rule(
             config=config,
             database=db,
             table=tbl,
-            columns=cols
+            columns=filtered_cols
         )
         table_rules.append(rule)
 

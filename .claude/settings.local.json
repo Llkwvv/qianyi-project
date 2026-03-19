@@ -16,7 +16,13 @@
       "Bash(ssh hadoop102:*)",
       "Bash(rsync:*)",
       "Bash(scp:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(find /home/lkw/qianyi-project -name *.yml -o -name *.yaml)",
+      "Bash(ping -c 2 172.20.10.2)",
+      "Bash(nc -zv 172.20.10.2 3306)",
+      "Bash(mysql -h 172.20.10.2 -P 3306 -u root -p000000 -e \"SELECT 1\")",
+      "Bash(mysql --version)",
+      "Bash(python3 -c \":*)"
     ]
   }
 }
