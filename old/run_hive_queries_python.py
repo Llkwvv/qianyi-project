@@ -9,8 +9,6 @@ import json
 import os
 import subprocess
 import pandas as pd
-from io import StringIO
-from datetime import datetime
 
 
 def parse_sql_file(sql_file: str) -> list:
@@ -42,7 +40,7 @@ def replace_placeholder(sql: str, data_dt: str) -> str:
     return sql.replace('{{data_dt}}', data_dt)
 
 
-def execute_hive_query_local(sql: str, hive_server: str) -> pd.DataFrame:
+def execute_hive_query_local(sql: str) -> pd.DataFrame:
     """本地执行 Hive 查询"""
     # 添加 MR 引擎设置
     sql_with_engine = "set hive.execution.engine=mr;\n" + sql
@@ -113,8 +111,6 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
     hive_host = ssh_config.get('hive_host', 'localhost')
     hive_port = ssh_config.get('hive_port', 10000)
     hive_username = ssh_config.get('username', '')
-
-    hive_server = f"jdbc:hive2://{hive_host}:{hive_port}/;user={hive_username}"
 
     try:
         # 先将 SQL 写入远程服务器的临时文件
@@ -320,7 +316,7 @@ def main():
         if use_ssh:
             df = execute_hive_query_ssh(actual_sql, ssh_config)
         else:
-            df = execute_hive_query_local(actual_sql, None)
+            df = execute_hive_query_local(actual_sql)
 
         if df is None or df.empty:
             print(f"  第 {i+1} 条语句返回空结果")

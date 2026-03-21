@@ -7,7 +7,6 @@ Hive SQL 模板生成脚本
 import argparse
 import json
 import os
-from pathlib import Path
 
 
 def load_config(config_path: str) -> dict:
