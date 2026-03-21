@@ -1,0 +1,23 @@
+{
+  "metastore_mysql": {
+    "host": "172.20.10.2",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore"
+  },
+  "clusters": {
+    "old": {
+      "ssh_host": "172.20.10.6",
+      "ssh_port": 22,
+      "ssh_user": "atguigu",
+      "hive_host": "localhost",
+      "port": 10000,
+      "username": "atguigu"
+    }
+  },
+  "validation_db": "validation_db",
+  "paths": {
+    "old_summary": "output/old_summary.csv"
+  }
+}
