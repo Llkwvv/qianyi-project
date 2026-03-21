@@ -42,11 +42,67 @@ def replace_placeholder(sql: str, data_dt: str) -> str:
     return sql.replace('{{data_dt}}', data_dt)
 
 
-def execute_hive_query(sql: str, ssh_config: dict = None) -> pd.DataFrame:
-    """
-    执行 Hive 查询，返回 DataFrame
-    使用 SSH 远程执行 beeline 命令
-    """
+def execute_hive_query_local(sql: str, hive_server: str) -> pd.DataFrame:
+    """本地执行 Hive 查询"""
+    # 添加 MR 引擎设置
+    sql_with_engine = "set hive.execution.engine=mr;\n" + sql
+
+    cmd = [
+        'hive',
+        '-e', sql_with_engine
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            print(f"执行失败: {result.stderr}")
+            return None
+
+        output = result.stdout.strip()
+        if not output:
+            return None
+
+        # 过滤提示符行
+        lines = []
+        for line in output.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('>') or line.startswith('0:') or line.startswith('.'):
+                continue
+            lines.append(line)
+
+        if len(lines) < 2:
+            return None
+
+        headers = lines[0].split('\t')
+        data = []
+        for line in lines[1:]:
+            cols = line.split('\t')
+            if len(cols) == len(headers):
+                data.append(cols)
+
+        if not data:
+            return None
+
+        df = pd.DataFrame(data, columns=headers)
+        return df
+
+    except subprocess.TimeoutExpired:
+        print("查询超时")
+        return None
+    except Exception as e:
+        print(f"执行错误: {e}")
+        return None
+
+
+def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
+    """SSH 远程执行 Hive 查询"""
     if not ssh_config:
         print("缺少 SSH 配置")
         return None
@@ -224,20 +280,26 @@ def main():
     config = load_env_config()
     cluster_config = config.get('clusters', {}).get(args.cluster, {})
 
-    # 读取 SSH 配置
-    if cluster_config:
-        ssh_config = {
-            'ssh_host': cluster_config.get('ssh_host'),
-            'ssh_port': cluster_config.get('ssh_port', 22),
-            'ssh_user': cluster_config.get('ssh_user'),
-            'hive_host': cluster_config.get('hive_host', 'localhost'),
-            'hive_port': cluster_config.get('port', 10000),
-            'username': cluster_config.get('username', '')
-        }
-        print(f"使用 SSH: {ssh_config['ssh_user']}@{ssh_config['ssh_host']}")
+    # 读取配置
+    use_ssh = cluster_config.get('use_ssh', True) if cluster_config else True
+
+    if use_ssh:
+        if cluster_config:
+            ssh_config = {
+                'ssh_host': cluster_config.get('ssh_host'),
+                'ssh_port': cluster_config.get('ssh_port', 22),
+                'ssh_user': cluster_config.get('ssh_user'),
+                'hive_host': cluster_config.get('hive_host', 'localhost'),
+                'hive_port': cluster_config.get('port', 10000),
+                'username': cluster_config.get('username', '')
+            }
+            print(f"使用 SSH: {ssh_config['ssh_user']}@{ssh_config['ssh_host']}")
+        else:
+            ssh_config = None
+            print("警告: 未找到集群配置")
     else:
         ssh_config = None
-        print("警告: 未找到集群配置")
+        print("使用本地 Hive")
 
     # 读取 SQL 文件
     print(f"读取 SQL 文件: {args.sql_file}")
@@ -254,7 +316,11 @@ def main():
         actual_sql = replace_placeholder(stmt, args.data_dt)
 
         # 执行查询
-        df = execute_hive_query(actual_sql, ssh_config)
+        # 根据配置选择本地或 SSH 执行
+        if use_ssh:
+            df = execute_hive_query_ssh(actual_sql, ssh_config)
+        else:
+            df = execute_hive_query_local(actual_sql, None)
 
         if df is None or df.empty:
             print(f"  第 {i+1} 条语句返回空结果")

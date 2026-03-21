@@ -8,6 +8,7 @@
   },
   "clusters": {
     "old": {
+      "use_ssh": true,
       "ssh_host": "172.20.10.6",
       "ssh_port": 22,
       "ssh_user": "atguigu",
