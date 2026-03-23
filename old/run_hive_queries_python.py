@@ -5,10 +5,10 @@ Hive 查询执行脚本
 """
 
 import argparse
+import csv
 import json
 import os
 import subprocess
-import pandas as pd
 
 
 def parse_sql_file(sql_file: str) -> list:
@@ -40,14 +40,13 @@ def replace_placeholder(sql: str, data_dt: str) -> str:
     return sql.replace('{{data_dt}}', data_dt)
 
 
-def execute_hive_query_local(sql: str) -> pd.DataFrame:
-    """本地执行 Hive 查询"""
-    # 添加 MR 引擎设置
-    sql_with_engine = "set hive.execution.engine=mr;\n" + sql
-
+def execute_hive_query_local(sql: str):
+    """本地执行 Hive 查询，返回 (headers, data) 元组"""
+    # 通过 --hiveconf 设置打印表头
     cmd = [
         'hive',
-        '-e', sql_with_engine
+        '--hiveconf', 'hive.cli.print.header=true',
+        '-e', sql
     ]
 
     try:
@@ -61,11 +60,11 @@ def execute_hive_query_local(sql: str) -> pd.DataFrame:
 
         if result.returncode != 0:
             print(f"执行失败: {result.stderr}")
-            return None
+            return None, None
 
         output = result.stdout.strip()
         if not output:
-            return None
+            return None, None
 
         # 过滤提示符行
         lines = []
@@ -76,7 +75,9 @@ def execute_hive_query_local(sql: str) -> pd.DataFrame:
             lines.append(line)
 
         if len(lines) < 2:
-            return None
+            # 调试：打印原始输出帮助排查问题
+            print(f"  警告: 解析失败，原始输出 = {output[:1000]}")
+            return None, None
 
         headers = lines[0].split('\t')
         data = []
@@ -86,24 +87,23 @@ def execute_hive_query_local(sql: str) -> pd.DataFrame:
                 data.append(cols)
 
         if not data:
-            return None
+            return None, None
 
-        df = pd.DataFrame(data, columns=headers)
-        return df
+        return headers, data
 
     except subprocess.TimeoutExpired:
         print("查询超时")
-        return None
+        return None, None
     except Exception as e:
         print(f"执行错误: {e}")
-        return None
+        return None, None
 
 
-def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
-    """SSH 远程执行 Hive 查询"""
+def execute_hive_query_ssh(sql: str, ssh_config: dict = None):
+    """SSH 远程执行 Hive 查询，返回 (headers, data) 元组"""
     if not ssh_config:
         print("缺少 SSH 配置")
-        return None
+        return None, None
 
     ssh_host = ssh_config.get('ssh_host')
     ssh_port = ssh_config.get('ssh_port', 22)
@@ -128,17 +128,18 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        # 在 SQL 前添加设置 MR 引擎
-        sql_with_engine = "set hive.execution.engine=mr;\n" + sql
+        # 通过 hiveconf 参数设置打印表头
+        sql_with_engine = sql
         stdout, stderr = write_process.communicate(input=sql_with_engine, timeout=30)
 
         if write_process.returncode != 0:
             print(f"写入远程文件失败: {stderr}")
-            return None
+            return None, None
 
         # 远程执行 beeline
         # 使用 hive -e 替代 beeline，输出更干净
-        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive -e \\"source {remote_sql_file}\\""'
+        # 通过 --hiveconf 设置打印表头
+        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive --hiveconf hive.cli.print.header=true -e \\"source {remote_sql_file}\\""'
 
         result = subprocess.run(
             ssh_cmd,
@@ -158,13 +159,19 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
         )
 
         if result.returncode != 0:
-            print(f"执行失败: {result.stderr}")
-            return None
+            print(f"  Hive 执行失败 (返回码: {result.returncode})")
+            print(f"  stderr: {result.stderr[:500]}")
+            return None, None
 
         # 解析 tab-separated 输出
         output = result.stdout.strip()
+
         if not output:
-            return None
+            print(f"  警告: Hive 返回空输出")
+            return None, None
+
+        # 打印前500字符帮助调试
+        print(f"  [调试] 原始输出前500字符:\n{output[:500]}")
 
         # 过滤 beeline 提示符和续行符
         lines = []
@@ -175,8 +182,13 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
                 continue
             lines.append(line)
 
+        print(f"  [调试] 过滤后行数: {len(lines)}")
+        if lines:
+            print(f"  [调试] 首行: {lines[0]}")
+
         if len(lines) < 2:
-            return None
+            print(f"  警告: 输出行数不足2行，无法解析")
+            return None, None
 
         # 首行为 header
         headers = lines[0].split('\t')
@@ -188,57 +200,65 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict = None) -> pd.DataFrame:
                 data.append(cols)
 
         if not data:
-            return None
+            print(f"  警告: 无有效数据行，过滤后所有行: {lines}")
+            return None, None
 
-        df = pd.DataFrame(data, columns=headers)
-        return df
+        return headers, data
 
     except subprocess.TimeoutExpired:
         print("查询超时")
-        return None
+        return None, None
     except Exception as e:
         print(f"执行错误: {e}")
-        return None
+        return None, None
 
 
-def expand_metrics(df: pd.DataFrame) -> pd.DataFrame:
+def expand_metrics(headers: list, data: list, cluster_name: str = 'old'):
     """
     动态展开指标列
     保留基础列：table_name, partition_col, computed_at, data_dt
     其余列均视为 metric 列，每个 metric 列展开为一行
+    返回: (headers, expanded_data) 元组
     """
-    if df is None or df.empty:
-        return pd.DataFrame()
+    if not headers or not data:
+        return None, None
 
     # 基础列（可能不存在）
     base_columns = ['table_name', 'partition_col', 'computed_at', 'data_dt']
 
     # 找出 metric 列（不在基础列中的）
-    metric_columns = [col for col in df.columns if col not in base_columns]
+    metric_columns = [col for col in headers if col not in base_columns]
 
     if not metric_columns:
-        return pd.DataFrame()
+        return None, None
+
+    # 构建列名到索引的映射
+    col_idx = {col: i for i, col in enumerate(headers)}
 
     # 展开每条记录
     expanded_rows = []
 
-    for _, row in df.iterrows():
+    for row in data:
         for metric_col in metric_columns:
-            metric_value = row.get(metric_col, None)
-            if metric_value is None:
+            metric_idx = col_idx.get(metric_col)
+            if metric_idx is None:
                 continue
 
-            new_row = {
-                'table_name': row.get('table_name', ''),
-                'partition_col': row.get('partition_col', ''),
-                'metric_name': metric_col,
-                'value': metric_value,
-                'computed_at': row.get('computed_at', ''),
-                'data_dt': row.get('data_dt', '')
-            }
+            metric_value = row[metric_idx] if metric_idx < len(row) else ''
+
+            new_row = [
+                cluster_name,
+                row[col_idx.get('table_name', 0)] if col_idx.get('table_name', 0) < len(row) else '',
+                row[col_idx.get('partition_col', 0)] if col_idx.get('partition_col', 0) < len(row) else '',
+                metric_col,
+                metric_value,
+                row[col_idx.get('computed_at', 0)] if col_idx.get('computed_at', 0) < len(row) else '',
+                row[col_idx.get('data_dt', 0)] if col_idx.get('data_dt', 0) < len(row) else ''
+            ]
             expanded_rows.append(new_row)
 
-    return pd.DataFrame(expanded_rows)
+    expanded_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
+    return expanded_headers, expanded_rows
 
 
 def main():
@@ -311,36 +331,45 @@ def main():
         # 替换占位符
         actual_sql = replace_placeholder(stmt, args.data_dt)
 
+        # 打印具体SQL内容
+        print(f"SQL: {actual_sql}")
+
         # 执行查询
         # 根据配置选择本地或 SSH 执行
         if use_ssh:
-            df = execute_hive_query_ssh(actual_sql, ssh_config)
+            headers, rows = execute_hive_query_ssh(actual_sql, ssh_config)
         else:
-            df = execute_hive_query_local(actual_sql)
+            headers, rows = execute_hive_query_local(actual_sql)
 
-        if df is None or df.empty:
+        if not headers or not rows:
             print(f"  第 {i+1} 条语句返回空结果")
             continue
 
-        print(f"  返回 {len(df)} 行，列: {list(df.columns)}")
+        print(f"  返回 {len(rows)} 行，列: {headers}")
 
         # 动态展开指标
-        expanded_df = expand_metrics(df)
-        if not expanded_df.empty:
-            all_results.append(expanded_df)
-            print(f"  展开为 {len(expanded_df)} 行")
+        expanded_headers, expanded_rows = expand_metrics(headers, rows, args.cluster)
+        if expanded_headers and expanded_rows:
+            all_results.append((expanded_headers, expanded_rows))
+            print(f"  展开为 {len(expanded_rows)} 行")
 
     if not all_results:
         print("没有结果可导出")
         return
 
-    # 合并所有结果
-    final_df = pd.concat(all_results, ignore_index=True)
+    # 合并所有结果（使用第一个结果的 headers）
+    final_headers = all_results[0][0]
+    final_rows = []
+    for _, rows in all_results:
+        final_rows.extend(rows)
 
-    # 导出 CSV（tab 分隔）
-    final_df.to_csv(args.output_csv, sep='\t', index=False)
+    # 导出 CSV（tab 分隔，不带表头）
+    with open(args.output_csv, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerows(final_rows)
+
     print(f"\n结果已导出: {args.output_csv}")
-    print(f"共 {len(final_df)} 行")
+    print(f"共 {len(final_rows)} 行")
 
 
 if __name__ == '__main__':

@@ -2,17 +2,17 @@
 """
 Hive 集群指标校验工具
 功能:
-  1. ingest-old: 从旧集群 CSV 读取并写入 Hive 目标表
-  2. run-new: 新集群执行相同语句，直接写入目标表
-  3. compare: 新旧集群指标对比并写入对比结果表
+  1. ingest-old: 从旧集群 CSV 读取并通过 LOAD DATA 写入 Hive 统一结果表（带 cluster=old 字段）
+  2. run-new: 新集群执行相同语句并通过 LOAD DATA 写入同一张表（带 cluster=new 字段）
 """
 
 import argparse
+import csv
 import json
 import os
 import subprocess
 import sys
-import pandas as pd
+import tempfile
 
 
 # ============== 通用函数 ==============
@@ -34,13 +34,48 @@ def get_cluster_config(config: dict, cluster: str) -> dict:
     return clusters[cluster]
 
 
+def get_mysql_config(config: dict) -> dict:
+    """获取 MySQL 配置"""
+    return config.get('mysql', {})
+
+
 def replace_placeholder(sql: str, data_dt: str) -> str:
     """替换模板中的 {{data_dt}} 占位符"""
     return sql.replace('{{data_dt}}', data_dt)
 
 
-def execute_hive_query_ssh(sql: str, ssh_config: dict) -> pd.DataFrame:
-    """SSH 远程执行 Hive 查询"""
+def upload_file_via_scp(local_file: str, ssh_config: dict, remote_dir: str = "/tmp") -> str:
+    """通过 SCP 上传文件到远程服务器"""
+    ssh_host = ssh_config.get('ssh_host')
+    ssh_port = ssh_config.get('ssh_port', 22)
+    ssh_user = ssh_config.get('ssh_user')
+
+    filename = os.path.basename(local_file)
+    remote_file = f"{remote_dir}/{filename}_{os.getpid()}"
+
+    try:
+        scp_cmd = f'scp -P {ssh_port} "{local_file}" {ssh_user}@{ssh_host}:"{remote_file}"'
+        result = subprocess.run(
+            scp_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            print(f"SCP 上传失败: {result.stderr}")
+            return None
+
+        return remote_file
+    except Exception as e:
+        print(f"SCP 上传错误: {e}")
+        return None
+
+
+def execute_hive_query_ssh(sql: str, ssh_config: dict):
+    """SSH 远程执行 Hive 查询，返回 (headers, data) 元组"""
     ssh_host = ssh_config.get('ssh_host')
     ssh_port = ssh_config.get('ssh_port', 22)
     ssh_user = ssh_config.get('ssh_user')
@@ -57,14 +92,14 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict) -> pd.DataFrame:
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        sql_with_engine = "set hive.execution.engine=mr;\n" + sql
+        sql_with_engine = "set hive.cli.print.header=true;\n" + sql
         stdout, stderr = write_process.communicate(input=sql_with_engine, timeout=30)
 
         if write_process.returncode != 0:
             print(f"写入远程文件失败: {stderr}")
-            return None
+            return None, None
 
-        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive -e \\"source {remote_sql_file}\\""'
+        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive --hiveconf hive.cli.print.header=true -e \\"source {remote_sql_file}\\""'
         result = subprocess.run(
             ssh_cmd,
             shell=True,
@@ -83,11 +118,11 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict) -> pd.DataFrame:
 
         if result.returncode != 0:
             print(f"执行失败: {result.stderr}")
-            return None
+            return None, None
 
         output = result.stdout.strip()
         if not output:
-            return None
+            return None, None
 
         lines = []
         for line in output.split('\n'):
@@ -97,7 +132,7 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict) -> pd.DataFrame:
             lines.append(line)
 
         if len(lines) < 2:
-            return None
+            return None, None
 
         headers = lines[0].split('\t')
         data = []
@@ -107,14 +142,13 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict) -> pd.DataFrame:
                 data.append(cols)
 
         if not data:
-            return None
+            return None, None
 
-        df = pd.DataFrame(data, columns=headers)
-        return df
+        return headers, data
 
     except Exception as e:
         print(f"执行错误: {e}")
-        return None
+        return None, None
 
 
 def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
@@ -135,14 +169,14 @@ def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        sql_with_engine = "set hive.execution.engine=mr;\n" + sql
+        sql_with_engine = "set hive.cli.print.header=true;\n" + sql
         stdout, stderr = write_process.communicate(input=sql_with_engine, timeout=30)
 
         if write_process.returncode != 0:
             print(f"写入远程文件失败: {stderr}")
             return False
 
-        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive -e \\"source {remote_sql_file}\\""'
+        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive --hiveconf hive.cli.print.header=true -e \\"source {remote_sql_file}\\""'
         result = subprocess.run(
             ssh_cmd,
             shell=True,
@@ -170,43 +204,78 @@ def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
         return False
 
 
-def expand_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """动态展开指标列"""
-    if df is None or df.empty:
-        return pd.DataFrame()
+def execute_hive_load_data(ssh_config: dict, remote_csv_path: str, validation_db: str, table_name: str, overwrite: bool = False) -> bool:
+    """通过 SSH 执行 Hive LOAD DATA 命令"""
+    ssh_host = ssh_config.get('ssh_host')
+    ssh_port = ssh_config.get('ssh_port', 22)
+    ssh_user = ssh_config.get('ssh_user')
+
+    full_table_name = f"{validation_db}.{table_name}"
+    overwrite_clause = "OVERWRITE" if overwrite else ""
+
+    load_sql = f"LOAD DATA LOCAL INPATH '{remote_csv_path}' {overwrite_clause} INTO TABLE {full_table_name};"
+    print(f"执行 LOAD DATA: {load_sql}")
+
+    return execute_hive_query_ssh_no_result(load_sql, ssh_config)
+
+
+def expand_metrics(headers: list, data: list, cluster: str):
+    """动态展开指标列并添加 cluster 字段，返回 (headers, expanded_data) 元组"""
+    if not headers or not data:
+        return None, None
 
     base_columns = ['table_name', 'partition_col', 'computed_at', 'data_dt']
-    metric_columns = [col for col in df.columns if col not in base_columns]
+    metric_columns = [col for col in headers if col not in base_columns]
 
     if not metric_columns:
-        return pd.DataFrame()
+        return None, None
+
+    # 构建列名到索引的映射
+    col_idx = {col: i for i, col in enumerate(headers)}
 
     expanded_rows = []
-    for _, row in df.iterrows():
+    for row in data:
         for metric_col in metric_columns:
-            metric_value = row.get(metric_col, None)
-            if metric_value is None:
+            metric_idx = col_idx.get(metric_col)
+            if metric_idx is None:
                 continue
 
-            new_row = {
-                'table_name': row.get('table_name', ''),
-                'partition_col': row.get('partition_col', ''),
-                'metric_name': metric_col,
-                'value': metric_value,
-                'computed_at': row.get('computed_at', ''),
-                'data_dt': row.get('data_dt', '')
-            }
+            metric_value = row[metric_idx] if metric_idx < len(row) else ''
+
+            new_row = [
+                cluster,
+                row[col_idx.get('table_name', 0)] if col_idx.get('table_name', 0) < len(row) else '',
+                row[col_idx.get('partition_col', 0)] if col_idx.get('partition_col', 0) < len(row) else '',
+                metric_col,
+                metric_value,
+                row[col_idx.get('computed_at', 0)] if col_idx.get('computed_at', 0) < len(row) else '',
+                row[col_idx.get('data_dt', 0)] if col_idx.get('data_dt', 0) < len(row) else ''
+            ]
             expanded_rows.append(new_row)
 
-    return pd.DataFrame(expanded_rows)
+    expanded_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
+    return expanded_headers, expanded_rows
+
+
+def create_database(validation_db: str, cluster_config: dict) -> bool:
+    """创建数据库（如果不存在）"""
+    create_sql = f"CREATE DATABASE IF NOT EXISTS {validation_db};"
+    print(f"创建数据库: {validation_db}")
+    return execute_hive_query_ssh_no_result(create_sql, cluster_config)
 
 
 def create_summary_table(validation_db: str, table_name: str, cluster_config: dict) -> bool:
-    """创建摘要表（如果不存在）"""
+    """创建统一结果表（如果不存在）"""
+    # 先确保数据库存在
+    if not create_database(validation_db, cluster_config):
+        print(f"创建数据库失败: {validation_db}")
+        return False
+
     full_table_name = f"{validation_db}.{table_name}"
 
     create_sql = f"""
 CREATE TABLE IF NOT EXISTS {full_table_name} (
+    cluster STRING,
     table_name STRING,
     partition_col STRING,
     metric_name STRING,
@@ -214,46 +283,46 @@ CREATE TABLE IF NOT EXISTS {full_table_name} (
     computed_at TIMESTAMP,
     data_dt STRING
 )
-STORED AS PARQUET;
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\t'
+STORED AS TEXTFILE;
 """
     print(f"创建表: {full_table_name}")
     return execute_hive_query_ssh_no_result(create_sql, cluster_config)
 
 
-def insert_data_to_hive(df: pd.DataFrame, validation_db: str, table_name: str, cluster_config: dict) -> bool:
-    """将 DataFrame 写入 Hive 表"""
-    full_table_name = f"{validation_db}.{table_name}"
+def cleanup_remote_file(remote_file: str, ssh_config: dict) -> bool:
+    """清理远程服务器上的临时文件"""
+    if not remote_file:
+        return True
 
-    for _, row in df.iterrows():
-        table_name_val = row.get('table_name', '').replace("'", "\\'")
-        partition_col_val = row.get('partition_col', '').replace("'", "\\'")
-        metric_name_val = row.get('metric_name', '').replace("'", "\\'")
-        value_val = row.get('value', '').replace("'", "\\'")
-        computed_at_val = row.get('computed_at', '')
-        data_dt_val = row.get('data_dt', '').replace("'", "\\'")
+    ssh_host = ssh_config.get('ssh_host')
+    ssh_port = ssh_config.get('ssh_port', 22)
+    ssh_user = ssh_config.get('ssh_user')
 
-        insert_sql = f"""
-INSERT INTO {full_table_name} VALUES (
-    '{table_name_val}',
-    '{partition_col_val}',
-    '{metric_name_val}',
-    '{value_val}',
-    '{computed_at_val}',
-    '{data_dt_val}'
-);
-"""
-        execute_hive_query_ssh_no_result(insert_sql, cluster_config)
-
-    print(f"成功写入 {len(df)} 行数据到 {full_table_name}")
-    return True
+    try:
+        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "rm -f {remote_file}"'
+        result = subprocess.run(
+            ssh_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"清理远程文件失败: {e}")
+        return False
 
 
 # ============== 子命令: ingest-old ==============
 
 def cmd_ingest_old(args):
-    """从旧集群 CSV 读取并写入 Hive 目标表"""
+    """从旧集群 CSV 读取并通过 LOAD DATA 写入 Hive 统一结果表（带 cluster=old 字段）"""
     config = load_env_config(args.config)
     validation_db = config.get('validation_db', 'validation_db')
+    metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
 
     cluster_config = get_cluster_config(config, args.cluster)
     print(f"使用集群: {args.cluster}")
@@ -262,27 +331,41 @@ def cmd_ingest_old(args):
     # 读取 CSV
     csv_path = args.csv
     if not os.path.isabs(csv_path):
-        csv_path = os.path.join(os.path.dirname(__file__), csv_path)
-
-    if not os.path.exists(csv_path):
-        print(f"CSV 文件不存在: {csv_path}")
-        return 1
-
-    df = pd.read_csv(csv_path, sep='\t', dtype=str)
-    print(f"读取 CSV: {csv_path}, 共 {len(df)} 行")
-    print(f"列: {list(df.columns)}")
-
-    # 验证列名
-    required_columns = ['table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
-    missing_cols = [col for col in required_columns if col not in df.columns]
-    if missing_cols:
-        print(f"警告: CSV 缺少列: {missing_cols}")
+        # 如果提供了相对路径，则相对于当前工作目录
+        if not os.path.exists(csv_path):
+            # 如果当前目录找不到，则尝试相对于脚本目录查找
+            script_relative_path = os.path.join(os.path.dirname(__file__), csv_path)
+            if os.path.exists(script_relative_path):
+                csv_path = script_relative_path
+            else:
+                print(f"CSV 文件不存在: {csv_path}")
+                return 1
+    else:
+        if not os.path.exists(csv_path):
+            print(f"CSV 文件不存在: {csv_path}")
+            return 1
 
     # 创建表
-    create_summary_table(validation_db, args.table, cluster_config)
+    create_summary_table(validation_db, metrics_summary_table, cluster_config)
 
-    # 插入数据
-    insert_data_to_hive(df, validation_db, args.table, cluster_config)
+    # 上传 CSV 文件到远程服务器
+    print(f"上传 CSV 文件到远程服务器: {csv_path}")
+    remote_csv_path = upload_file_via_scp(csv_path, cluster_config)
+    if not remote_csv_path:
+        print("上传 CSV 文件失败")
+        return 1
+
+    try:
+        # 执行 LOAD DATA 命令
+        success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
+        if success:
+            print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+        else:
+            print("LOAD DATA 执行失败")
+            return 1
+    finally:
+        # 清理远程文件
+        cleanup_remote_file(remote_csv_path, cluster_config)
 
     print("\n完成!")
     return 0
@@ -291,9 +374,10 @@ def cmd_ingest_old(args):
 # ============== 子命令: run-new ==============
 
 def cmd_run_new(args):
-    """新集群执行相同语句，直接写入目标表"""
+    """新集群执行相同语句并通过 LOAD DATA 写入同一张表（带 cluster=new 字段）"""
     config = load_env_config(args.config)
     validation_db = config.get('validation_db', 'validation_db')
+    metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
 
     cluster_config = get_cluster_config(config, args.cluster)
     print(f"使用集群: {args.cluster}")
@@ -302,11 +386,19 @@ def cmd_run_new(args):
     # 读取 SQL 文件
     sql_file = args.sql_file
     if not os.path.isabs(sql_file):
-        sql_file = os.path.join(os.path.dirname(__file__), sql_file)
-
-    if not os.path.exists(sql_file):
-        print(f"SQL 文件不存在: {sql_file}")
-        return 1
+        # 如果提供了相对路径，则相对于当前工作目录
+        if not os.path.exists(sql_file):
+            # 如果当前目录找不到，则尝试相对于脚本目录查找
+            script_relative_path = os.path.join(os.path.dirname(__file__), sql_file)
+            if os.path.exists(script_relative_path):
+                sql_file = script_relative_path
+            else:
+                print(f"SQL 文件不存在: {sql_file}")
+                return 1
+    else:
+        if not os.path.exists(sql_file):
+            print(f"SQL 文件不存在: {sql_file}")
+            return 1
 
     with open(sql_file, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -315,7 +407,7 @@ def cmd_run_new(args):
     print(f"读取 SQL 文件: {sql_file}, 共 {len(statements)} 条语句")
 
     # 创建目标表
-    create_summary_table(validation_db, args.table, cluster_config)
+    create_summary_table(validation_db, metrics_summary_table, cluster_config)
 
     # 执行每条语句
     all_results = []
@@ -324,251 +416,82 @@ def cmd_run_new(args):
         print(f"\n执行第 {i+1} 条语句...")
 
         actual_sql = replace_placeholder(stmt, args.data_dt)
-        df = execute_hive_query_ssh(actual_sql, cluster_config)
 
-        if df is None or df.empty:
+        # 打印具体SQL内容
+        print(f"SQL: {actual_sql}")
+
+        headers, rows = execute_hive_query_ssh(actual_sql, cluster_config)
+
+        if not headers or not rows:
             print(f"  第 {i+1} 条语句返回空结果")
             continue
 
-        print(f"  返回 {len(df)} 行，列: {list(df.columns)}")
+        print(f"  返回 {len(rows)} 行，列: {headers}")
 
-        expanded_df = expand_metrics(df)
-        if not expanded_df.empty:
-            all_results.append(expanded_df)
-            print(f"  展开为 {len(expanded_df)} 行")
+        expanded_headers, expanded_rows = expand_metrics(headers, rows, 'new')
+        if expanded_headers and expanded_rows:
+            all_results.append((expanded_headers, expanded_rows))
+            print(f"  展开为 {len(expanded_rows)} 行")
 
     if not all_results:
         print("没有结果可导出")
         return 1
 
     # 合并结果
-    final_df = pd.concat(all_results, ignore_index=True)
+    final_headers = all_results[0][0]
+    final_rows = []
+    for _, rows in all_results:
+        final_rows.extend(rows)
 
-    # 写入 Hive 表
-    insert_data_to_hive(final_df, validation_db, args.table, cluster_config)
+    # 保存为临时 CSV 文件
+    temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+    temp_csv_path = temp_csv.name
+    temp_csv.close()
 
-    # 导出 CSV
-    if args.output_csv:
-        output_csv = args.output_csv
-        if not os.path.isabs(output_csv):
-            output_csv = os.path.join(os.path.dirname(__file__), output_csv)
+    try:
+        # 写入 CSV 文件（tab 分隔，不带表头）
+        with open(temp_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerows(final_rows)
+        print(f"结果已保存到临时文件: {temp_csv_path}")
 
-        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-        final_df.to_csv(output_csv, sep='\t', index=False)
-        print(f"\nCSV 已导出: {output_csv}")
+        # 上传 CSV 文件到远程服务器
+        print(f"上传结果 CSV 文件到远程服务器")
+        remote_csv_path = upload_file_via_scp(temp_csv_path, cluster_config)
+        if not remote_csv_path:
+            print("上传 CSV 文件失败")
+            return 1
 
-    print(f"\n完成! 共处理 {len(final_df)} 行")
-    return 0
+        try:
+            # 执行 LOAD DATA 命令
+            success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
+            if success:
+                print("新集群数据已通过 LOAD DATA 成功载入 Hive 表")
+            else:
+                print("LOAD DATA 执行失败")
+                return 1
+        finally:
+            # 清理远程文件
+            cleanup_remote_file(remote_csv_path, cluster_config)
 
+        # 导出 CSV
+        if args.output_csv:
+            output_csv = args.output_csv
+            if not os.path.isabs(output_csv):
+                output_csv = os.path.join(os.path.dirname(__file__), output_csv)
 
-# ============== 子命令: compare ==============
+            os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+            with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f, delimiter='\t')
+                writer.writerows(final_rows)
+            print(f"\nCSV 已导出: {output_csv}")
 
-def query_table_data(validation_db: str, table_name: str, data_dt: str, cluster_config: dict) -> pd.DataFrame:
-    """查询表数据"""
-    full_table_name = f"{validation_db}.{table_name}"
-    query_sql = f"SELECT * FROM {full_table_name} WHERE data_dt = '{data_dt}'"
+    finally:
+        # 清理临时文件
+        if os.path.exists(temp_csv_path):
+            os.unlink(temp_csv_path)
 
-    print(f"查询表: {full_table_name}, data_dt = {data_dt}")
-    df = execute_hive_query_ssh(query_sql, cluster_config)
-
-    if df is not None and not df.empty:
-        print(f"  查询到 {len(df)} 行")
-
-    return df if df is not None else pd.DataFrame()
-
-
-def compare_metrics(old_df: pd.DataFrame, new_df: pd.DataFrame, threshold: float = 0.0) -> pd.DataFrame:
-    """对比新旧集群指标"""
-    if old_df.empty:
-        print("旧表数据为空")
-        return pd.DataFrame()
-    if new_df.empty:
-        print("新表数据为空")
-        return pd.DataFrame()
-
-    # 标准化 value 列
-    def normalize_value(val):
-        if pd.isna(val) or val == '' or val == 'NULL':
-            return None
-        return str(val)
-
-    old_df['value'] = old_df['value'].apply(normalize_value)
-    new_df['value'] = new_df['value'].apply(normalize_value)
-
-    # 合并两个表
-    merged = pd.merge(
-        old_df[['table_name', 'partition_col', 'metric_name', 'value', 'data_dt']],
-        new_df[['table_name', 'partition_col', 'metric_name', 'value', 'data_dt']],
-        on=['table_name', 'partition_col', 'metric_name', 'data_dt'],
-        how='outer',
-        suffixes=('_old', '_new')
-    )
-
-    results = []
-    for _, row in merged.iterrows():
-        old_value = row.get('value_old')
-        new_value = row.get('value_new')
-
-        # 判断状态
-        if old_value is None and new_value is None:
-            status = 'MISSING_BOTH'
-            diff = None
-            reason = '双方值都为空'
-        elif old_value is None:
-            status = 'MISSING_OLD'
-            diff = None
-            reason = '旧集群缺失'
-        elif new_value is None:
-            status = 'MISSING_NEW'
-            diff = None
-            reason = '新集群缺失'
-        else:
-            try:
-                old_num = float(old_value) if old_value else 0
-                new_num = float(new_value) if new_value else 0
-                diff = new_num - old_num
-
-                if abs(diff) <= threshold:
-                    status = 'PASS'
-                    reason = None
-                else:
-                    status = 'FAIL'
-                    reason = f'差值 {diff} 超过阈值 {threshold}'
-            except ValueError:
-                if old_value == new_value:
-                    status = 'PASS'
-                    diff = None
-                    reason = None
-                else:
-                    status = 'FAIL'
-                    diff = None
-                    reason = f'值不一致: {old_value} vs {new_value}'
-
-        result_row = {
-            'table_name': row.get('table_name', ''),
-            'partition_col': row.get('partition_col', ''),
-            'metric_name': row.get('metric_name', ''),
-            'data_dt': row.get('data_dt', ''),
-            'old_value': old_value if old_value else '',
-            'new_value': new_value if new_value else '',
-            'diff': str(diff) if diff is not None else '',
-            'status': status,
-            'reason': reason if reason else '',
-            'compared_at': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        results.append(result_row)
-
-    return pd.DataFrame(results)
-
-
-def create_compare_table(validation_db: str, table_name: str, cluster_config: dict) -> bool:
-    """创建对比结果表"""
-    full_table_name = f"{validation_db}.{table_name}"
-
-    create_sql = f"""
-CREATE TABLE IF NOT EXISTS {full_table_name} (
-    table_name STRING,
-    partition_col STRING,
-    metric_name STRING,
-    data_dt STRING,
-    old_value STRING,
-    new_value STRING,
-    diff STRING,
-    status STRING,
-    reason STRING,
-    compared_at TIMESTAMP
-)
-STORED AS PARQUET;
-"""
-    print(f"创建对比结果表: {full_table_name}")
-    return execute_hive_query_ssh_no_result(create_sql, cluster_config)
-
-
-def insert_compare_results(df: pd.DataFrame, validation_db: str, table_name: str, cluster_config: dict) -> bool:
-    """写入对比结果到 Hive 表"""
-    full_table_name = f"{validation_db}.{table_name}"
-
-    for _, row in df.iterrows():
-        table_name_val = row.get('table_name', '').replace("'", "\\'")
-        partition_col_val = row.get('partition_col', '').replace("'", "\\'")
-        metric_name_val = row.get('metric_name', '').replace("'", "\\'")
-        data_dt_val = row.get('data_dt', '').replace("'", "\\'")
-        old_value_val = row.get('old_value', '').replace("'", "\\'")
-        new_value_val = row.get('new_value', '').replace("'", "\\'")
-        diff_val = row.get('diff', '').replace("'", "\\'")
-        status_val = row.get('status', '').replace("'", "\\'")
-        reason_val = row.get('reason', '').replace("'", "\\'")
-        compared_at_val = row.get('compared_at', '')
-
-        insert_sql = f"""
-INSERT INTO {full_table_name} VALUES (
-    '{table_name_val}',
-    '{partition_col_val}',
-    '{metric_name_val}',
-    '{data_dt_val}',
-    '{old_value_val}',
-    '{new_value_val}',
-    '{diff_val}',
-    '{status_val}',
-    '{reason_val}',
-    '{compared_at_val}'
-);
-"""
-        execute_hive_query_ssh_no_result(insert_sql, cluster_config)
-
-    print(f"成功写入 {len(df)} 行对比结果到 {full_table_name}")
-    return True
-
-
-def cmd_compare(args):
-    """新旧集群指标对比并写入对比结果表"""
-    config = load_env_config(args.config)
-    validation_db = config.get('validation_db', 'validation_db')
-
-    cluster_config = get_cluster_config(config, args.cluster)
-    print(f"使用集群: {args.cluster}")
-    print(f"SSH: {cluster_config['ssh_user']}@{cluster_config['ssh_host']}")
-    print(f"对比阈值: {args.threshold}")
-
-    # 查询旧表数据
-    print("\n=== 查询旧集群数据 ===")
-    old_df = query_table_data(validation_db, args.old_table, args.data_dt, cluster_config)
-
-    # 查询新表数据
-    print("\n=== 查询新集群数据 ===")
-    new_df = query_table_data(validation_db, args.new_table, args.data_dt, cluster_config)
-
-    # 对比
-    print("\n=== 对比指标 ===")
-    compare_df = compare_metrics(old_df, new_df, args.threshold)
-
-    if compare_df.empty:
-        print("没有可对比的数据")
-        return 1
-
-    # 统计结果
-    status_counts = compare_df['status'].value_counts()
-    print("\n对比结果统计:")
-    for status, count in status_counts.items():
-        print(f"  {status}: {count}")
-
-    # 创建对比结果表
-    create_compare_table(validation_db, args.compare_table, cluster_config)
-
-    # 写入对比结果
-    insert_compare_results(compare_df, validation_db, args.compare_table, cluster_config)
-
-    # 导出 CSV
-    if args.output_csv:
-        output_csv = args.output_csv
-        if not os.path.isabs(output_csv):
-            output_csv = os.path.join(os.path.dirname(__file__), output_csv)
-
-        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-        compare_df.to_csv(output_csv, sep='\t', index=False)
-        print(f"\nCSV 已导出: {output_csv}")
-
-    print("\n完成!")
+    print(f"\n完成! 共处理 {len(final_rows)} 行")
     return 0
 
 
@@ -582,7 +505,6 @@ def main():
 示例:
   %(prog)s ingest-old --csv ../old/output/old_summary.csv --data-dt 2024-01-01
   %(prog)s run-new --sql-file output/metrics_queries.sql --data-dt 2024-01-01
-  %(prog)s compare --data-dt 2024-01-01
         """
     )
     parser.add_argument(
@@ -594,28 +516,18 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
     # ingest-old 子命令
-    parser_ingest = subparsers.add_parser('ingest-old', help='从旧集群 CSV 读取并写入 Hive 目标表')
+    parser_ingest = subparsers.add_parser('ingest-old', help='从旧集群 CSV 读取并通过 LOAD DATA 写入 Hive 统一结果表（带 cluster=old 字段）')
     parser_ingest.add_argument('--csv', required=True, help='旧集群导出的 CSV 文件路径')
-    parser_ingest.add_argument('--table', default='old_summary', help='目标表名（不含库名）')
     parser_ingest.add_argument('--cluster', default='new', help='目标集群')
+    parser_ingest.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
 
     # run-new 子命令
-    parser_run = subparsers.add_parser('run-new', help='新集群执行相同语句，直接写入目标表')
+    parser_run = subparsers.add_parser('run-new', help='新集群执行相同语句并通过 LOAD DATA 写入同一张表（带 cluster=new 字段）')
     parser_run.add_argument('--sql-file', default='output/metrics_queries.sql', help='SQL 文件路径')
     parser_run.add_argument('--data-dt', required=True, help='分区日期')
-    parser_run.add_argument('--table', default='new_summary', help='目标表名（不含库名）')
     parser_run.add_argument('--cluster', default='new', help='集群名称')
+    parser_run.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
     parser_run.add_argument('--output-csv', help='输出 CSV 文件路径（可选）')
-
-    # compare 子命令
-    parser_cmp = subparsers.add_parser('compare', help='新旧集群指标对比并写入对比结果表')
-    parser_cmp.add_argument('--data-dt', required=True, help='分区日期')
-    parser_cmp.add_argument('--old-table', default='old_summary', help='旧集群结果表名')
-    parser_cmp.add_argument('--new-table', default='new_summary', help='新集群结果表名')
-    parser_cmp.add_argument('--compare-table', default='compare_result', help='对比结果表名')
-    parser_cmp.add_argument('--cluster', default='new', help='集群名称')
-    parser_cmp.add_argument('--threshold', type=float, default=0.0, help='数值对比阈值')
-    parser_cmp.add_argument('--output-csv', help='输出 CSV 文件路径（可选）')
 
     args = parser.parse_args()
 
@@ -627,8 +539,6 @@ def main():
         return cmd_ingest_old(args)
     elif args.command == 'run-new':
         return cmd_run_new(args)
-    elif args.command == 'compare':
-        return cmd_compare(args)
     else:
         parser.print_help()
         return 1

@@ -50,10 +50,10 @@ def generate_sql_for_table(table: dict) -> str:
     # decimal 字段的 sum 聚合
     for field in fields:
         field_name = field['name']
-        field_type = field['type']
+        field_type = field.get('type', 'decimal(38,2)')
         if 'decimal' in field_type.lower():
             col_alias = f"{field_name}_sum"
-            select_cols.append(f"sum(cast({field_name} as decimal(38,2))) as {col_alias}")
+            select_cols.append(f"sum(cast({field_name} as {field_type})) as {col_alias}")
 
     # 构造 SELECT 语句
     select_clause = ",\n    ".join(select_cols)
