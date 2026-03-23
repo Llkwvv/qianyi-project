@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import subprocess
+from datetime import datetime
 
 
 def parse_sql_file(sql_file: str) -> list:
@@ -277,8 +278,7 @@ def main():
     )
     parser.add_argument(
         '--output-csv',
-        default='old_summary_data.csv',
-        help='输出 CSV 文件路径'
+        help='输出 CSV 文件路径（默认: /data/transfer_agent/data/upload/yyyymmdd）'
     )
     parser.add_argument(
         '--cluster',
@@ -291,6 +291,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 如果未指定输出路径，使用默认路径 /data/transfer_agent/data/upload/yyyymmdd
+    if not args.output_csv:
+        today = datetime.now().strftime('%Y%m%d')
+        args.output_csv = f'/data/transfer_agent/data/upload/{today}/old_summary.csv'
+        print(f"使用默认输出路径: {args.output_csv}")
 
     # 读取配置文件获取集群信息
     config = load_env_config()
@@ -364,6 +370,11 @@ def main():
         final_rows.extend(rows)
 
     # 导出 CSV（tab 分隔，不带表头）
+    # 确保输出目录存在
+    output_dir = os.path.dirname(args.output_csv)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(args.output_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f, delimiter='\t')
         writer.writerows(final_rows)

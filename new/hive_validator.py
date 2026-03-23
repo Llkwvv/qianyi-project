@@ -92,14 +92,16 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict):
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        sql_with_engine = "set hive.cli.print.header=true;\n" + sql
-        stdout, stderr = write_process.communicate(input=sql_with_engine, timeout=30)
+        sql_with_header = "set hive.cli.print.header=true;\n" + sql
+        stdout, stderr = write_process.communicate(input=sql_with_header, timeout=30)
 
         if write_process.returncode != 0:
             print(f"写入远程文件失败: {stderr}")
             return None, None
 
-        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive --hiveconf hive.cli.print.header=true -e \\"source {remote_sql_file}\\""'
+        # 使用 beeline -f 参数执行 SQL 文件
+        beeline_url = ssh_config.get('beeline_url', 'jdbc:hive2://localhost:10000/default')
+        ssh_cmd = f"ssh -p {ssh_port} {ssh_user}@{ssh_host} 'beeline -u \"{beeline_url}\" -n {ssh_user} -f {remote_sql_file}'"
         result = subprocess.run(
             ssh_cmd,
             shell=True,
@@ -109,6 +111,7 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict):
             timeout=300
         )
 
+        # 清理远程 SQL 文件
         subprocess.run(
             f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "rm -f {remote_sql_file}"',
             shell=True,
@@ -124,20 +127,49 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict):
         if not output:
             return None, None
 
+        # 过滤 beeline 输出中的装饰行（边框、连接信息等）
         lines = []
         for line in output.split('\n'):
             line = line.strip()
-            if not line or line.startswith('>') or line.startswith('0:') or line.startswith('.'):
+            # 跳过空行、提示符、边框符号
+            if not line:
+                continue
+            if line.startswith('>') or line.startswith('0:') or line.startswith('.'):
+                continue
+            # 只过滤纯边框行（整行只有 + | = 符号），保留实际数据行
+            if line.startswith('+') or line.startswith('='):
+                continue
+            if line.startswith('|') and all(c in '| +-=' or c.isspace() for c in line):
+                continue
+            if line.startswith('Connecting') or line.startswith('Connected') or line.startswith('Hive on'):
+                continue
+            if line.startswith('Hadoop job') or line.startswith('Query'):
+                continue
+            if 'No rows affected' in line:
+                continue
+            if 'row selected' in line or 'rows selected' in line:
+                continue
+            if line.startswith('jdbc:'):
                 continue
             lines.append(line)
 
         if len(lines) < 2:
             return None, None
 
-        headers = lines[0].split('\t')
+        # 解析表头和数据行（beeline 使用 | 分隔）
+        def parse_beeline_line(line):
+            # 去掉首尾的 |，然后按 | 分割
+            line = line.strip()
+            if line.startswith('|'):
+                line = line[1:]
+            if line.endswith('|'):
+                line = line[:-1]
+            return [col.strip() for col in line.split('|')]
+
+        headers = parse_beeline_line(lines[0])
         data = []
         for line in lines[1:]:
-            cols = line.split('\t')
+            cols = parse_beeline_line(line)
             if len(cols) == len(headers):
                 data.append(cols)
 
@@ -169,14 +201,15 @@ def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
-        sql_with_engine = "set hive.cli.print.header=true;\n" + sql
-        stdout, stderr = write_process.communicate(input=sql_with_engine, timeout=30)
+        stdout, stderr = write_process.communicate(input=sql, timeout=30)
 
         if write_process.returncode != 0:
             print(f"写入远程文件失败: {stderr}")
             return False
 
-        ssh_cmd = f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "hive --hiveconf hive.cli.print.header=true -e \\"source {remote_sql_file}\\""'
+        # 使用 beeline -f 参数执行 SQL 文件
+        beeline_url = ssh_config.get('beeline_url', 'jdbc:hive2://localhost:10000/default')
+        ssh_cmd = f"ssh -p {ssh_port} {ssh_user}@{ssh_host} 'beeline -u \"{beeline_url}\" -n {ssh_user} -f {remote_sql_file}'"
         result = subprocess.run(
             ssh_cmd,
             shell=True,
@@ -186,6 +219,7 @@ def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
             timeout=300
         )
 
+        # 清理远程 SQL 文件
         subprocess.run(
             f'ssh -p {ssh_port} {ssh_user}@{ssh_host} "rm -f {remote_sql_file}"',
             shell=True,
@@ -348,9 +382,40 @@ def cmd_ingest_old(args):
     # 创建表
     create_summary_table(validation_db, metrics_summary_table, cluster_config)
 
+    # 检查 CSV 是否有表头，并跳过表头行
+    expected_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
+    csv_to_upload = csv_path
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        first_line = f.readline().strip()
+        first_cols = first_line.split('\t')
+        has_header = all(col.lower() == expected_headers[i].lower() for i, col in enumerate(first_cols) if i < len(expected_headers))
+
+    if has_header:
+        print(f"检测到 CSV 包含表头，将跳过第一行")
+        # 创建临时文件，不包含表头
+        import tempfile
+        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        temp_csv_path = temp_csv.name
+        temp_csv.close()
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            next(f)  # 跳过第一行（表头）
+            with open(temp_csv_path, 'w', encoding='utf-8') as out:
+                out.write(f.read())
+
+        csv_to_upload = temp_csv_path
+        print(f"临时文件（无表头）: {csv_to_upload}")
+
     # 上传 CSV 文件到远程服务器
-    print(f"上传 CSV 文件到远程服务器: {csv_path}")
-    remote_csv_path = upload_file_via_scp(csv_path, cluster_config)
+    print(f"上传 CSV 文件到远程服务器: {csv_to_upload}")
+    remote_csv_path = upload_file_via_scp(csv_to_upload, cluster_config)
+
+    # 清理本地临时文件
+    if csv_to_upload != csv_path and os.path.exists(csv_to_upload):
+        os.unlink(csv_to_upload)
+        print(f"已清理本地临时文件")
+
     if not remote_csv_path:
         print("上传 CSV 文件失败")
         return 1

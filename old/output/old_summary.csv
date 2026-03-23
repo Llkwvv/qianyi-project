@@ -1,5 +1,5 @@
-table_name	partition_col	metric_name	value	computed_at	data_dt
-gmall.dim_activity_full	dt	row_count	0	2026-03-22 01:34:03.462	2024-01-01
-gmall.dim_activity_full	dt	condition_amount_sum	NULL	2026-03-22 01:34:03.462	2024-01-01
-gmall.dim_activity_full	dt	benefit_amount_sum	NULL	2026-03-22 01:34:03.462	2024-01-01
-gmall.dim_activity_full	dt	benefit_discount_sum	NULL	2026-03-22 01:34:03.462	2024-01-01
+cluster	table_name	partition_col	metric_name	value	computed_at	data_dt
+old	gmall.dim_activity_full	dt	row_count	0	2026-03-23 09:47:38.039	2024-03-20
+old	gmall.dim_activity_full	dt	condition_amount_sum	NULL	2026-03-23 09:47:38.039	2024-03-20
+old	gmall.dim_activity_full	dt	benefit_amount_sum	NULL	2026-03-23 09:47:38.039	2024-03-20
+old	gmall.dim_activity_full	dt	benefit_discount_sum	NULL	2026-03-23 09:47:38.039	2024-03-20
