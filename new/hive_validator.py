@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 
 
 # ============== 通用函数 ==============
@@ -72,6 +73,104 @@ def upload_file_via_scp(local_file: str, ssh_config: dict, remote_dir: str = "/t
     except Exception as e:
         print(f"SCP 上传错误: {e}")
         return None
+
+
+def execute_hive_query(sql: str, cluster_config: dict):
+    """执行 Hive 查询，根据配置选择 SSH 或本地 beeline 方式"""
+    use_ssh = cluster_config.get('use_ssh', True)
+
+    if use_ssh:
+        return execute_hive_query_ssh(sql, cluster_config)
+    else:
+        return execute_hive_query_beeline(sql, cluster_config)
+
+
+def execute_hive_query_beeline(sql: str, cluster_config: dict):
+    """本地直接执行 beeline 查询，返回 (headers, data) 元组"""
+    beeline_url = cluster_config.get('beeline_url', 'jdbc:hive2://localhost:10000/default')
+
+    try:
+        # 设置 beeline 命令，开启 header 输出
+        full_sql = f"set hive.cli.print.header=true;{sql}"
+
+        # 使用 beeline -e 参数直接执行 SQL，--silent=true 减少输出
+        cmd = [
+            'beeline',
+            '-u', beeline_url,
+            '--silent=true --showHeader=false --outputformat=tsv2',
+            '-e', full_sql
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            print(f"执行失败: {result.stderr}")
+            return None, None
+
+        output = result.stdout.strip()
+        if not output:
+            return None, None
+
+        # 过滤 beeline 输出中的装饰行（边框、连接信息等）
+        lines = []
+        for line in output.split('\n'):
+            line = line.strip()
+            # 跳过空行、提示符、边框符号
+            if not line:
+                continue
+            if line.startswith('>') or line.startswith('0:') or line.startswith('.'):
+                continue
+            # 只过滤纯边框行（整行只有 + | = 符号），保留实际数据行
+            if line.startswith('+') or line.startswith('='):
+                continue
+            if line.startswith('|') and all(c in '| +-=' or c.isspace() for c in line):
+                continue
+            if line.startswith('Connecting') or line.startswith('Connected') or line.startswith('Hive on'):
+                continue
+            if line.startswith('Hadoop job') or line.startswith('Query'):
+                continue
+            if 'No rows affected' in line:
+                continue
+            if 'row selected' in line or 'rows selected' in line:
+                continue
+            if line.startswith('jdbc:'):
+                continue
+            lines.append(line)
+
+        if len(lines) < 2:
+            return None, None
+
+        # 解析表头和数据行（beeline 使用 | 分隔）
+        def parse_beeline_line(line):
+            # 去掉首尾的 |，然后按 | 分割
+            line = line.strip()
+            if line.startswith('|'):
+                line = line[1:]
+            if line.endswith('|'):
+                line = line[:-1]
+            return [col.strip() for col in line.split('|')]
+
+        headers = parse_beeline_line(lines[0])
+        data = []
+        for line in lines[1:]:
+            cols = parse_beeline_line(line)
+            if len(cols) == len(headers):
+                data.append(cols)
+
+        if not data:
+            return None, None
+
+        return headers, data
+
+    except Exception as e:
+        print(f"执行错误: {e}")
+        return None, None
 
 
 def execute_hive_query_ssh(sql: str, ssh_config: dict):
@@ -183,6 +282,48 @@ def execute_hive_query_ssh(sql: str, ssh_config: dict):
         return None, None
 
 
+def execute_hive_query_no_result(sql: str, cluster_config: dict) -> bool:
+    """执行 Hive 查询（不返回结果），根据配置选择 SSH 或本地 beeline 方式"""
+    use_ssh = cluster_config.get('use_ssh', True)
+
+    if use_ssh:
+        return execute_hive_query_ssh_no_result(sql, cluster_config)
+    else:
+        return execute_hive_query_beeline_no_result(sql, cluster_config)
+
+
+def execute_hive_query_beeline_no_result(sql: str, cluster_config: dict) -> bool:
+    """本地直接执行 beeline 查询（不返回结果）"""
+    beeline_url = cluster_config.get('beeline_url', 'jdbc:hive2://localhost:10000/default')
+
+    try:
+        # 使用 beeline -e 参数直接执行 SQL，--silent=true 减少输出
+        cmd = [
+            'beeline',
+            '-u', beeline_url,
+            '--silent=true --showHeader=false --outputformat=tsv2',
+            '-e', sql
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=300
+        )
+
+        if result.returncode != 0:
+            print(f"执行失败: {result.stderr}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"执行错误: {e}")
+        return False
+
+
 def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
     """SSH 远程执行 Hive 查询（不返回结果）"""
     ssh_host = ssh_config.get('ssh_host')
@@ -238,19 +379,50 @@ def execute_hive_query_ssh_no_result(sql: str, ssh_config: dict) -> bool:
         return False
 
 
-def execute_hive_load_data(ssh_config: dict, remote_csv_path: str, validation_db: str, table_name: str, overwrite: bool = False) -> bool:
-    """通过 SSH 执行 Hive LOAD DATA 命令"""
-    ssh_host = ssh_config.get('ssh_host')
-    ssh_port = ssh_config.get('ssh_port', 22)
-    ssh_user = ssh_config.get('ssh_user')
+def execute_hive_insert(cluster_config: dict, headers: list, rows: list, validation_db: str, table_name: str, overwrite: bool = False) -> bool:
+    """执行 Hive INSERT 批量写入"""
+    if not rows:
+        return True
 
     full_table_name = f"{validation_db}.{table_name}"
     overwrite_clause = "OVERWRITE" if overwrite else ""
 
-    load_sql = f"LOAD DATA LOCAL INPATH '{remote_csv_path}' {overwrite_clause} INTO TABLE {full_table_name};"
+    # 批量生成 VALUES 子句，每行数据用括号包裹
+    values_list = []
+    for row in rows:
+        # 对每个值进行处理，NULL 保持原样，字符串加引号
+        formatted_values = []
+        for val in row:
+            if val is None or val == '' or val.upper() == 'NULL':
+                formatted_values.append('NULL')
+            else:
+                # 转义单引号
+                val_str = str(val).replace("'", "''")
+                formatted_values.append(f"'{val_str}'")
+        values_list.append(f"({','.join(formatted_values)})")
+
+    # 拼接完整的 INSERT 语句
+    # Hive: INSERT INTO 或 INSERT OVERWRITE（不需要 TABLE 关键字）
+    values_clause = ',\n'.join(values_list)
+    if overwrite_clause:
+        insert_sql = f"INSERT {overwrite_clause} TABLE {full_table_name} VALUES\n{values_clause};"
+    else:
+        insert_sql = f"INSERT INTO {full_table_name} VALUES\n{values_clause};"
+
+    print(f"执行 INSERT: {len(rows)} 行")
+
+    return execute_hive_query_no_result(insert_sql, cluster_config)
+
+
+def execute_hive_load_data(cluster_config: dict, file_path: str, validation_db: str, table_name: str, overwrite: bool = False) -> bool:
+    """执行 Hive LOAD DATA 命令"""
+    full_table_name = f"{validation_db}.{table_name}"
+    overwrite_clause = "OVERWRITE" if overwrite else ""
+
+    load_sql = f"LOAD DATA LOCAL INPATH '{file_path}' {overwrite_clause} INTO TABLE {full_table_name};"
     print(f"执行 LOAD DATA: {load_sql}")
 
-    return execute_hive_query_ssh_no_result(load_sql, ssh_config)
+    return execute_hive_query_no_result(load_sql, cluster_config)
 
 
 def expand_metrics(headers: list, data: list, cluster: str):
@@ -295,7 +467,7 @@ def create_database(validation_db: str, cluster_config: dict) -> bool:
     """创建数据库（如果不存在）"""
     create_sql = f"CREATE DATABASE IF NOT EXISTS {validation_db};"
     print(f"创建数据库: {validation_db}")
-    return execute_hive_query_ssh_no_result(create_sql, cluster_config)
+    return execute_hive_query_no_result(create_sql, cluster_config)
 
 
 def create_summary_table(validation_db: str, table_name: str, cluster_config: dict) -> bool:
@@ -322,7 +494,7 @@ FIELDS TERMINATED BY '\t'
 STORED AS TEXTFILE;
 """
     print(f"创建表: {full_table_name}")
-    return execute_hive_query_ssh_no_result(create_sql, cluster_config)
+    return execute_hive_query_no_result(create_sql, cluster_config)
 
 
 def cleanup_remote_file(remote_file: str, ssh_config: dict) -> bool:
@@ -359,11 +531,22 @@ def cmd_ingest_old(args):
     metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
 
     cluster_config = get_cluster_config(config, args.cluster)
+    use_ssh = cluster_config.get('use_ssh', True)
+
     print(f"使用集群: {args.cluster}")
-    print(f"SSH: {cluster_config['ssh_user']}@{cluster_config['ssh_host']}")
+    if use_ssh:
+        print(f"SSH: {cluster_config['ssh_user']}@{cluster_config['ssh_host']}")
+    else:
+        print(f"Beeline: {cluster_config.get('beeline_url')}")
 
     # 读取 CSV
     csv_path = args.csv
+    if not csv_path:
+        # 默认路径：与 old 文件夹导出路径一致
+        today = datetime.now().strftime('%Y%m%d')
+        csv_path = f'/data/transfer_agent/data/upload/{today}/old_summary.csv'
+        print(f"使用默认 CSV 路径: {csv_path}")
+
     if not os.path.isabs(csv_path):
         # 如果提供了相对路径，则相对于当前工作目录
         if not os.path.exists(csv_path):
@@ -382,55 +565,69 @@ def cmd_ingest_old(args):
     # 创建表
     create_summary_table(validation_db, metrics_summary_table, cluster_config)
 
-    # 检查 CSV 是否有表头，并跳过表头行
+    # 检查 CSV 是否有表头，并解析数据
     expected_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
-    csv_to_upload = csv_path
 
     with open(csv_path, 'r', encoding='utf-8') as f:
         first_line = f.readline().strip()
         first_cols = first_line.split('\t')
         has_header = all(col.lower() == expected_headers[i].lower() for i, col in enumerate(first_cols) if i < len(expected_headers))
 
-    if has_header:
-        print(f"检测到 CSV 包含表头，将跳过第一行")
-        # 创建临时文件，不包含表头
-        import tempfile
-        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-        temp_csv_path = temp_csv.name
-        temp_csv.close()
+    # 读取 CSV 数据
+    csv_rows = []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        if has_header:
+            next(f)  # 跳过表头
+        reader = csv.reader(f, delimiter='\t')
+        for row in reader:
+            if row:
+                csv_rows.append(row)
 
-        with open(csv_path, 'r', encoding='utf-8') as f:
-            next(f)  # 跳过第一行（表头）
-            with open(temp_csv_path, 'w', encoding='utf-8') as out:
-                out.write(f.read())
+    print(f"读取 CSV: {len(csv_rows)} 行数据")
 
-        csv_to_upload = temp_csv_path
-        print(f"临时文件（无表头）: {csv_to_upload}")
-
-    # 上传 CSV 文件到远程服务器
-    print(f"上传 CSV 文件到远程服务器: {csv_to_upload}")
-    remote_csv_path = upload_file_via_scp(csv_to_upload, cluster_config)
-
-    # 清理本地临时文件
-    if csv_to_upload != csv_path and os.path.exists(csv_to_upload):
-        os.unlink(csv_to_upload)
-        print(f"已清理本地临时文件")
-
-    if not remote_csv_path:
-        print("上传 CSV 文件失败")
+    if not csv_rows:
+        print("没有数据")
         return 1
 
+    # 保存为临时 CSV 文件
+    temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+    temp_csv_path = temp_csv.name
+    temp_csv.close()
+
     try:
-        # 执行 LOAD DATA 命令
-        success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
-        if success:
-            print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+        with open(temp_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerows(csv_rows)
+        print(f"临时文件: {temp_csv_path}")
+
+        if use_ssh:
+            # SSH 模式：上传到远程服务器
+            print(f"上传 CSV 文件到远程服务器")
+            remote_csv_path = upload_file_via_scp(temp_csv_path, cluster_config)
+            if not remote_csv_path:
+                print("上传 CSV 文件失败")
+                return 1
+
+            try:
+                success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
+                if success:
+                    print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+                else:
+                    print("LOAD DATA 执行失败")
+                    return 1
+            finally:
+                cleanup_remote_file(remote_csv_path, cluster_config)
         else:
-            print("LOAD DATA 执行失败")
-            return 1
+            # Beeline 本地模式
+            success = execute_hive_load_data(cluster_config, temp_csv_path, validation_db, metrics_summary_table, args.overwrite)
+            if success:
+                print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+            else:
+                print("LOAD DATA 执行失败")
+                return 1
     finally:
-        # 清理远程文件
-        cleanup_remote_file(remote_csv_path, cluster_config)
+        if os.path.exists(temp_csv_path):
+            os.unlink(temp_csv_path)
 
     print("\n完成!")
     return 0
@@ -445,8 +642,13 @@ def cmd_run_new(args):
     metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
 
     cluster_config = get_cluster_config(config, args.cluster)
+    use_ssh = cluster_config.get('use_ssh', True)
+
     print(f"使用集群: {args.cluster}")
-    print(f"SSH: {cluster_config['ssh_user']}@{cluster_config['ssh_host']}")
+    if use_ssh:
+        print(f"SSH: {cluster_config['ssh_user']}@{cluster_config['ssh_host']}")
+    else:
+        print(f"Beeline: {cluster_config.get('beeline_url')}")
 
     # 读取 SQL 文件
     sql_file = args.sql_file
@@ -485,7 +687,7 @@ def cmd_run_new(args):
         # 打印具体SQL内容
         print(f"SQL: {actual_sql}")
 
-        headers, rows = execute_hive_query_ssh(actual_sql, cluster_config)
+        headers, rows = execute_hive_query(actual_sql, cluster_config)
 
         if not headers or not rows:
             print(f"  第 {i+1} 条语句返回空结果")
@@ -508,54 +710,213 @@ def cmd_run_new(args):
     for _, rows in all_results:
         final_rows.extend(rows)
 
+    print(f"合并结果: {len(final_rows)} 行")
+
+    # 通过 INSERT 写入 Hive 表
+    success = execute_hive_insert(cluster_config, final_headers, final_rows, validation_db, metrics_summary_table, args.overwrite)
+    if success:
+        print("新集群数据已通过 INSERT 成功写入 Hive 表")
+    else:
+        print("INSERT 执行失败")
+        return 1
+
+    # 导出 CSV
+    if args.output_csv:
+        output_csv = args.output_csv
+        if not os.path.isabs(output_csv):
+            output_csv = os.path.join(os.path.dirname(__file__), output_csv)
+
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerows(final_rows)
+        print(f"\nCSV 已导出: {output_csv}")
+
+    print(f"\n完成! 共处理 {len(final_rows)} 行")
+    return 0
+
+
+# ============== 子命令: run-all ==============
+
+def cmd_run_all(args):
+    """依次执行 ingest-old 和 run-new"""
+    config = load_env_config(args.config)
+    validation_db = config.get('validation_db', 'validation_db')
+    metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
+
+    cluster_config = get_cluster_config(config, args.cluster)
+    use_ssh = cluster_config.get('use_ssh', True)
+
+    print(f"========== 步骤 1: ingest-old ==========")
+    print(f"使用集群: {args.cluster}")
+    if use_ssh:
+        print(f"SSH: {cluster_config['ssh_user']}@{cluster_config['ssh_host']}")
+    else:
+        print(f"Beeline: {cluster_config.get('beeline_url')}")
+
+    # 读取 CSV
+    csv_path = args.csv
+    if not csv_path:
+        # 默认路径：与 old 文件夹导出路径一致
+        today = datetime.now().strftime('%Y%m%d')
+        csv_path = f'/data/transfer_agent/data/upload/{today}/old_summary.csv'
+        print(f"使用默认 CSV 路径: {csv_path}")
+
+    if not os.path.isabs(csv_path):
+        script_relative_path = os.path.join(os.path.dirname(__file__), csv_path)
+        if os.path.exists(script_relative_path):
+            csv_path = script_relative_path
+
+    if not os.path.exists(csv_path):
+        print(f"CSV 文件不存在: {csv_path}")
+        return 1
+
+    # 创建表
+    create_summary_table(validation_db, metrics_summary_table, cluster_config)
+
+    # 检查 CSV 是否有表头
+    expected_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
+    csv_to_use = csv_path
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        first_line = f.readline().strip()
+        first_cols = first_line.split('\t')
+        has_header = all(col.lower() == expected_headers[i].lower() for i, col in enumerate(first_cols) if i < len(expected_headers))
+
+    if has_header:
+        print(f"检测到 CSV 包含表头，将跳过第一行")
+
+    # 读取 CSV 数据
+    csv_rows = []
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        if has_header:
+            next(f)  # 跳过表头
+        reader = csv.reader(f, delimiter='\t')
+        for row in reader:
+            if row:
+                csv_rows.append(row)
+
+    print(f"读取 CSV: {len(csv_rows)} 行数据")
+
+    if not csv_rows:
+        print("没有数据")
+        return 1
+
     # 保存为临时 CSV 文件
     temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
     temp_csv_path = temp_csv.name
     temp_csv.close()
 
     try:
-        # 写入 CSV 文件（tab 分隔，不带表头）
         with open(temp_csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter='\t')
-            writer.writerows(final_rows)
-        print(f"结果已保存到临时文件: {temp_csv_path}")
+            writer.writerows(csv_rows)
+        print(f"临时文件: {temp_csv_path}")
 
-        # 上传 CSV 文件到远程服务器
-        print(f"上传结果 CSV 文件到远程服务器")
-        remote_csv_path = upload_file_via_scp(temp_csv_path, cluster_config)
-        if not remote_csv_path:
-            print("上传 CSV 文件失败")
-            return 1
+        if use_ssh:
+            # SSH 模式：上传到远程服务器
+            print(f"上传 CSV 文件到远程服务器")
+            remote_csv_path = upload_file_via_scp(temp_csv_path, cluster_config)
+            if not remote_csv_path:
+                print("上传 CSV 文件失败")
+                return 1
 
-        try:
-            # 执行 LOAD DATA 命令
-            success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
+            try:
+                success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
+                if success:
+                    print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+                else:
+                    print("LOAD DATA 执行失败")
+                    return 1
+            finally:
+                cleanup_remote_file(remote_csv_path, cluster_config)
+        else:
+            # Beeline 本地模式
+            success = execute_hive_load_data(cluster_config, temp_csv_path, validation_db, metrics_summary_table, args.overwrite)
             if success:
-                print("新集群数据已通过 LOAD DATA 成功载入 Hive 表")
+                print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
             else:
                 print("LOAD DATA 执行失败")
                 return 1
-        finally:
-            # 清理远程文件
-            cleanup_remote_file(remote_csv_path, cluster_config)
-
-        # 导出 CSV
-        if args.output_csv:
-            output_csv = args.output_csv
-            if not os.path.isabs(output_csv):
-                output_csv = os.path.join(os.path.dirname(__file__), output_csv)
-
-            os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-            with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f, delimiter='\t')
-                writer.writerows(final_rows)
-            print(f"\nCSV 已导出: {output_csv}")
-
     finally:
-        # 清理临时文件
         if os.path.exists(temp_csv_path):
             os.unlink(temp_csv_path)
 
+    print(f"========== 步骤 1 完成 ==========\n")
+
+    print(f"========== 步骤 2: run-new ==========")
+    # 读取 SQL 文件
+    sql_file = args.sql_file
+    if not os.path.isabs(sql_file):
+        script_relative_path = os.path.join(os.path.dirname(__file__), sql_file)
+        if os.path.exists(script_relative_path):
+            sql_file = script_relative_path
+
+    if not os.path.exists(sql_file):
+        print(f"SQL 文件不存在: {sql_file}")
+        return 1
+
+    with open(sql_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    statements = [stmt.strip() for stmt in content.split(';') if stmt.strip()]
+    print(f"读取 SQL 文件: {sql_file}, 共 {len(statements)} 条语句")
+
+    # 执行每条语句
+    all_results = []
+
+    for i, stmt in enumerate(statements):
+        print(f"\n执行第 {i+1} 条语句...")
+
+        actual_sql = replace_placeholder(stmt, args.data_dt)
+        print(f"SQL: {actual_sql}")
+
+        headers, rows = execute_hive_query(actual_sql, cluster_config)
+
+        if not headers or not rows:
+            print(f"  第 {i+1} 条语句返回空结果")
+            continue
+
+        print(f"  返回 {len(rows)} 行，列: {headers}")
+
+        expanded_headers, expanded_rows = expand_metrics(headers, rows, 'new')
+        if expanded_headers and expanded_rows:
+            all_results.append((expanded_headers, expanded_rows))
+            print(f"  展开为 {len(expanded_rows)} 行")
+
+    if not all_results:
+        print("没有结果可导出")
+        return 1
+
+    # 合并结果
+    final_headers = all_results[0][0]
+    final_rows = []
+    for _, rows in all_results:
+        final_rows.extend(rows)
+
+    print(f"合并结果: {len(final_rows)} 行")
+
+    # 通过 INSERT 写入 Hive 表
+    success = execute_hive_insert(cluster_config, final_headers, final_rows, validation_db, metrics_summary_table, args.overwrite)
+    if success:
+        print("新集群数据已通过 INSERT 成功写入 Hive 表")
+    else:
+        print("INSERT 执行失败")
+        return 1
+
+    # 导出 CSV
+    if args.output_csv:
+        output_csv = args.output_csv
+        if not os.path.isabs(output_csv):
+            output_csv = os.path.join(os.path.dirname(__file__), output_csv)
+
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerows(final_rows)
+        print(f"\nCSV 已导出: {output_csv}")
+
+    print(f"\n========== 步骤 2 完成 ==========")
     print(f"\n完成! 共处理 {len(final_rows)} 行")
     return 0
 
@@ -570,6 +931,7 @@ def main():
 示例:
   %(prog)s ingest-old --csv ../old/output/old_summary.csv --data-dt 2024-01-01
   %(prog)s run-new --sql-file output/metrics_queries.sql --data-dt 2024-01-01
+  %(prog)s run-all --csv input/old_summary.csv --sql-file sql/metrics_queries.sql --data-dt 2024-01-01
         """
     )
     parser.add_argument(
@@ -594,6 +956,15 @@ def main():
     parser_run.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
     parser_run.add_argument('--output-csv', help='输出 CSV 文件路径（可选）')
 
+    # run-all 子命令
+    parser_all = subparsers.add_parser('run-all', help='依次执行 ingest-old 和 run-new')
+    parser_all.add_argument('--csv', required=True, help='旧集群导出的 CSV 文件路径')
+    parser_all.add_argument('--sql-file', default='sql/metrics_queries.sql', help='SQL 文件路径')
+    parser_all.add_argument('--data-dt', required=True, help='分区日期')
+    parser_all.add_argument('--cluster', default='new', help='集群名称')
+    parser_all.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
+    parser_all.add_argument('--output-csv', help='输出 CSV 文件路径（可选）')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -604,6 +975,8 @@ def main():
         return cmd_ingest_old(args)
     elif args.command == 'run-new':
         return cmd_run_new(args)
+    elif args.command == 'run-all':
+        return cmd_run_all(args)
     else:
         parser.print_help()
         return 1
