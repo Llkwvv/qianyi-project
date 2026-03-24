@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import datetime
 
 
 def load_env_config(config_path: str = 'env_config.json') -> dict:
@@ -31,7 +32,7 @@ def get_table_stats(mysql_config: dict, data_dt: str):
         port=mysql_config.get('port'),
         user=mysql_config['user'],
         password=mysql_config['password'],
-        database=mysql_config.get('database') or mysql_config.get('db') or 'hive',
+        database=mysql_config.get('database') or mysql_config.get('db'),
         charset='utf8mb4'
     )
 
@@ -45,6 +46,7 @@ def get_table_stats(mysql_config: dict, data_dt: str):
 
     # 查询指定日期分区的表统计信息
     # 从 PARTITION_KEYS 表获取每个表的第一个分区字段名（INTEGER_IDX=0）
+    # 包括非分区表（没有分区记录的表）
     sql = f"""
     SELECT
         d.NAME as database_name,
@@ -55,17 +57,17 @@ def get_table_stats(mysql_config: dict, data_dt: str):
         tp_total_size.PARAM_VALUE as total_size,
         tp_num_files.PARAM_VALUE as num_files,
         tp_raw_size.PARAM_VALUE as raw_data_size,
-        t.LAST_ACCESS_TIME as last_access_time
+        t.LAST_ACCESS_TIME as last_access_time,
+        '{data_dt}' as data_dt
     FROM TBLS t
     JOIN DBS d ON t.DB_ID = d.DB_ID
-    JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID
-    JOIN PARTITION_KEYS pk ON t.TBL_ID = pk.TBL_ID AND pk.INTEGER_IDX = 0
+    LEFT JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID
+    LEFT JOIN PARTITION_KEYS pk ON t.TBL_ID = pk.TBL_ID AND pk.INTEGER_IDX = 0
     LEFT JOIN TABLE_PARAMS tp_num_rows ON t.TBL_ID = tp_num_rows.TBL_ID AND tp_num_rows.PARAM_KEY = 'numRows'
     LEFT JOIN TABLE_PARAMS tp_total_size ON t.TBL_ID = tp_total_size.TBL_ID AND tp_total_size.PARAM_KEY = 'totalSize'
     LEFT JOIN TABLE_PARAMS tp_num_files ON t.TBL_ID = tp_num_files.TBL_ID AND tp_num_files.PARAM_KEY = 'numFiles'
     LEFT JOIN TABLE_PARAMS tp_raw_size ON t.TBL_ID = tp_raw_size.TBL_ID AND tp_raw_size.PARAM_KEY = 'rawDataSize'
-    WHERE p.PART_NAME LIKE CONCAT(pk.PKEY_NAME, '=%{date_pattern}%')
-    ORDER BY d.NAME, t.TBL_NAME, p.PART_NAME
+    WHERE p.PART_NAME LIKE CONCAT(pk.PKEY_NAME, '=%{date_pattern}%') OR p.PART_NAME IS NULL
     """
 
     cursor.execute(sql)
@@ -118,15 +120,14 @@ def main():
     config = load_env_config()
     mysql_config = config.get('metastore_mysql', {}).copy()
 
-    # 默认输出路径
+    # 输出路径
     if not args.output_csv:
         table_stats_config = config.get('table_stats', {})
         output_dir = table_stats_config.get('output_dir')
         if not output_dir:
             print("错误: 请通过配置文件或命令行提供输出目录")
             return
-        args.output_csv = os.path.join(output_dir, f'{args.data_dt}_table_stats.csv')
-        print(f"使用默认输出路径: {args.output_csv}")
+        args.output_csv = os.path.join(output_dir, f'{datetime.date.today().strftime("%Y%m%d")}/{args.data_dt}_old_table_stats.csv')
 
     # 命令行参数覆盖配置
     if args.mysql_host:
@@ -166,7 +167,7 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
 
     headers = ['database_name', 'table_name', 'table_type', 'partition_name',
-               'num_files', 'total_size', 'raw_data_size', 'num_rows', 'last_access_time']
+               'num_files', 'total_size', 'raw_data_size', 'num_rows', 'last_access_time', 'data_dt']
 
     with open(args.output_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
