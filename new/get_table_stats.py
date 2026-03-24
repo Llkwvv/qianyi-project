@@ -28,7 +28,7 @@ def get_table_stats(mysql_config: dict, data_dt: str):
 
     conn = pymysql.connect(
         host=mysql_config['host'],
-        port=mysql_config.get('port', 3306),
+        port=mysql_config.get('port'),
         user=mysql_config['user'],
         password=mysql_config['password'],
         database=mysql_config.get('database') or mysql_config.get('db') or 'hive',
@@ -93,7 +93,6 @@ def main():
     parser.add_argument(
         '--mysql-port',
         type=int,
-        default=3306,
         help='MySQL 端口'
     )
     parser.add_argument(
@@ -118,7 +117,10 @@ def main():
     # 默认输出路径
     if not args.output_csv:
         table_stats_config = config.get('table_stats', {})
-        output_dir = table_stats_config.get('output_dir', '.')
+        output_dir = table_stats_config.get('output_dir')
+        if not output_dir:
+            print("错误: 请通过配置文件或命令行提供输出目录")
+            return
         args.output_csv = os.path.join(output_dir, f'{args.data_dt}_table_stats.csv')
         print(f"使用默认输出路径: {args.output_csv}")
 
@@ -137,13 +139,13 @@ def main():
     if not mysql_config.get('database') and mysql_config.get('db'):
         mysql_config['database'] = mysql_config['db']
 
-    if not mysql_config.get('host') or not mysql_config.get('user'):
-        print("错误: 请通过配置文件或命令行提供 MySQL 连接信息")
+    if not mysql_config.get('host') or not mysql_config.get('user') or not mysql_config.get('port'):
+        print("错误: 请通过配置文件或命令行提供完整的 MySQL 连接信息")
         print("配置示例:")
-        print('  {"metastore": {"host": "localhost", "port": 3306, "user": "root", "password": "xxx", "database": "hive"}}')
+        print('  {"metastore_mysql": {"host": "localhost", "port": 3306, "user": "root", "password": "xxx", "db": "metastore"}}')
         return
 
-    print(f"连接 MySQL: {mysql_config['user']}@{mysql_config['host']}:{mysql_config.get('port', 3306)}/{mysql_config.get('database', 'hive')}")
+    print(f"连接 MySQL: {mysql_config['user']}@{mysql_config['host']}:{mysql_config['port']}/{mysql_config.get('database') or mysql_config.get('db')}")
 
     # 获取数据
     results = get_table_stats(mysql_config, args.data_dt)

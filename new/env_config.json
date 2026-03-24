@@ -13,14 +13,14 @@
     }
   },
   "metastore_mysql": {
-    "host": "172.20.10.6",
-    "port": 3306,
-    "user": "root",
-    "password": "000000",
-    "db": "metastore"
+    "host": "",
+    "port": 0,
+    "user": "",
+    "password": "",
+    "db": ""
   },
   "table_stats": {
-    "output_dir": "/home/lkw/qianyi-project/new/output"
+    "output_dir": ""
   },
   "validation_db": "validation_db",
   "tables": {
