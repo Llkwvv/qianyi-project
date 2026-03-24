@@ -7,7 +7,6 @@ import argparse
 import csv
 import json
 import os
-from datetime import datetime
 
 
 def load_env_config(config_path: str = 'env_config.json') -> dict:
@@ -119,8 +118,8 @@ def main():
     # 默认输出路径
     if not args.output_csv:
         table_stats_config = config.get('table_stats', {})
-        output_dir = table_stats_config.get('output_dir', '/home/lkw/qianyi-project/new/output')
-        args.output_csv = f'{output_dir}/{args.data_dt}_table_stats.csv'
+        output_dir = table_stats_config.get('output_dir', '.')
+        args.output_csv = os.path.join(output_dir, f'{args.data_dt}_table_stats.csv')
         print(f"使用默认输出路径: {args.output_csv}")
 
     # 命令行参数覆盖配置
