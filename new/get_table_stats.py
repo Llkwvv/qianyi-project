@@ -171,6 +171,10 @@ def main():
 
     with open(args.output_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
+        # Write header row first
+        writer.writerow(['database_name', 'table_name', 'table_type', 'partition_name',
+                        'num_files', 'total_size', 'raw_data_size', 'num_rows', 'last_access_time', 'data_dt'])
+        # Then write the data rows
         writer.writerows(results)
 
     print(f"\n结果已导出: {args.output_csv}")

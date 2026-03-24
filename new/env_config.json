@@ -12,6 +12,13 @@
       "beeline_url": "jdbc:hive2://xxxxxx:xxx,xxxxxxx:xxx,xxxxxxx:xxx/;serverdiscoverymode=zookeeper;zookeepernamespace=hiveserver2"
     }
   },
+  "insert_mysql": {
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "your_password_here",
+    "db": "validation_db"
+  },
   "metastore_mysql": {
     "host": "",
     "port": 0,
