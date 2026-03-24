@@ -18,7 +18,7 @@ def load_env_config(config_path: str = 'env_config.json') -> dict:
         return json.load(f)
 
 
-def get_table_stats(mysql_config: dict, data_dt: str):
+def get_table_stats(mysql_config: dict, data_dt: str, partition_key: str):
     """从 MySQL 获取 Hive 表统计信息"""
     try:
         import pymysql
@@ -38,11 +38,15 @@ def get_table_stats(mysql_config: dict, data_dt: str):
     cursor = conn.cursor()
 
     # 查询指定分区的表统计信息
-    # 将 20250324 转换为 dt=2025-03-24 格式
+    # 将 20250324 转换为模糊匹配模式，支持多级分区如 data_dt=2025-12-31/indicator=DK0001
     if len(data_dt) == 8:
-        partition_name = f"dt={data_dt[:4]}-{data_dt[4:6]}-{data_dt[6:8]}"
+        date_pattern = f"{data_dt[:4]}-{data_dt[4:6]}-{data_dt[6:8]}"
     else:
-        partition_name = f"dt={data_dt}"
+        date_pattern = data_dt
+
+    # 构建分区匹配条件：支持 partition_key=日期 或包含该日期的分区
+    partition_pattern = f"{partition_key}={date_pattern}"
+
     sql = f"""
     SELECT
         d.NAME as database_name,
@@ -56,12 +60,12 @@ def get_table_stats(mysql_config: dict, data_dt: str):
         t.LAST_ACCESS_TIME as last_access_time
     FROM TBLS t
     JOIN DBS d ON t.DB_ID = d.DB_ID
-    JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID AND p.PART_NAME = '{partition_name}'
+    JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID AND p.PART_NAME LIKE '%{partition_pattern}%'
     LEFT JOIN TABLE_PARAMS tp_num_rows ON t.TBL_ID = tp_num_rows.TBL_ID AND tp_num_rows.PARAM_KEY = 'numRows'
     LEFT JOIN TABLE_PARAMS tp_total_size ON t.TBL_ID = tp_total_size.TBL_ID AND tp_total_size.PARAM_KEY = 'totalSize'
     LEFT JOIN TABLE_PARAMS tp_num_files ON t.TBL_ID = tp_num_files.TBL_ID AND tp_num_files.PARAM_KEY = 'numFiles'
     LEFT JOIN TABLE_PARAMS tp_raw_size ON t.TBL_ID = tp_raw_size.TBL_ID AND tp_raw_size.PARAM_KEY = 'rawDataSize'
-    ORDER BY d.NAME, t.TBL_NAME
+    ORDER BY d.NAME, t.TBL_NAME, p.PART_NAME
     """
 
     cursor.execute(sql)
@@ -81,6 +85,11 @@ def main():
         '--data-dt',
         required=True,
         help='分区日期，如 20250324'
+    )
+    parser.add_argument(
+        '--partition-key',
+        default='dt',
+        help='分区字段名，默认为 dt'
     )
     parser.add_argument(
         '--output-csv',
@@ -148,7 +157,7 @@ def main():
     print(f"连接 MySQL: {mysql_config['user']}@{mysql_config['host']}:{mysql_config['port']}/{mysql_config.get('database') or mysql_config.get('db')}")
 
     # 获取数据
-    results = get_table_stats(mysql_config, args.data_dt)
+    results = get_table_stats(mysql_config, args.data_dt, args.partition_key)
 
     if not results:
         print("未获取到数据")
