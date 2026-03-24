@@ -19,6 +19,9 @@
     "password": "000000",
     "db": "metastore"
   },
+  "table_stats": {
+    "output_dir": "/home/lkw/qianyi-project/new/output"
+  },
   "validation_db": "validation_db",
   "tables": {
     "metrics_summary": "metrics_summary"

@@ -112,15 +112,16 @@ def main():
 
     args = parser.parse_args()
 
-    # 默认输出路径
-    if not args.output_csv:
-        today = datetime.now().strftime('%Y%m%d')
-        args.output_csv = f'/home/lkw/qianyi-project/new/output/{today}_table_stats.csv'
-        print(f"使用默认输出路径: {args.output_csv}")
-
     # 加载配置
     config = load_env_config()
     mysql_config = config.get('metastore_mysql', {}).copy()
+
+    # 默认输出路径
+    if not args.output_csv:
+        table_stats_config = config.get('table_stats', {})
+        output_dir = table_stats_config.get('output_dir', '/home/lkw/qianyi-project/new/output')
+        args.output_csv = f'{output_dir}/{args.data_dt}_table_stats.csv'
+        print(f"使用默认输出路径: {args.output_csv}")
 
     # 命令行参数覆盖配置
     if args.mysql_host:
