@@ -19,7 +19,7 @@ def load_env_config(config_path: str = 'env_config.json') -> dict:
         return json.load(f)
 
 
-def get_table_stats(mysql_config: dict):
+def get_table_stats(mysql_config: dict, data_dt: str):
     """从 MySQL 获取 Hive 表统计信息"""
     try:
         import pymysql
@@ -38,8 +38,13 @@ def get_table_stats(mysql_config: dict):
 
     cursor = conn.cursor()
 
-    # 查询所有表及其统计信息
-    sql = """
+    # 查询指定分区的表统计信息
+    # 将 20250324 转换为 dt=2025-03-24 格式
+    if len(data_dt) == 8:
+        partition_name = f"dt={data_dt[:4]}-{data_dt[4:6]}-{data_dt[6:8]}"
+    else:
+        partition_name = f"dt={data_dt}"
+    sql = f"""
     SELECT
         d.NAME as database_name,
         t.TBL_NAME as table_name,
@@ -52,12 +57,12 @@ def get_table_stats(mysql_config: dict):
         t.LAST_ACCESS_TIME as last_access_time
     FROM TBLS t
     JOIN DBS d ON t.DB_ID = d.DB_ID
-    LEFT JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID
+    JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID AND p.PART_NAME = '{partition_name}'
     LEFT JOIN TABLE_PARAMS tp_num_rows ON t.TBL_ID = tp_num_rows.TBL_ID AND tp_num_rows.PARAM_KEY = 'numRows'
     LEFT JOIN TABLE_PARAMS tp_total_size ON t.TBL_ID = tp_total_size.TBL_ID AND tp_total_size.PARAM_KEY = 'totalSize'
     LEFT JOIN TABLE_PARAMS tp_num_files ON t.TBL_ID = tp_num_files.TBL_ID AND tp_num_files.PARAM_KEY = 'numFiles'
     LEFT JOIN TABLE_PARAMS tp_raw_size ON t.TBL_ID = tp_raw_size.TBL_ID AND tp_raw_size.PARAM_KEY = 'rawDataSize'
-    ORDER BY d.NAME, t.TBL_NAME, p.PART_NAME
+    ORDER BY d.NAME, t.TBL_NAME
     """
 
     cursor.execute(sql)
@@ -72,6 +77,11 @@ def get_table_stats(mysql_config: dict):
 def main():
     parser = argparse.ArgumentParser(
         description='从 Hive 元数据库(MySQL)获取表信息'
+    )
+    parser.add_argument(
+        '--data-dt',
+        required=True,
+        help='分区日期，如 20250324'
     )
     parser.add_argument(
         '--output-csv',
@@ -136,7 +146,7 @@ def main():
     print(f"连接 MySQL: {mysql_config['user']}@{mysql_config['host']}:{mysql_config.get('port', 3306)}/{mysql_config.get('database', 'hive')}")
 
     # 获取数据
-    results = get_table_stats(mysql_config)
+    results = get_table_stats(mysql_config, args.data_dt)
 
     if not results:
         print("未获取到数据")
