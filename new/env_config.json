@@ -1,53 +1,29 @@
 {
-  "metastore_mysql": {
-    "host": "172.20.10.2",
-    "port": 3306,
-    "user": "root",
-    "password": "000000",
-    "db": "metastore"
-  },
   "clusters": {
-    "old": {
-      "use_ssh": true,
-      "ssh_host": "172.20.10.6",
-      "ssh_port": 22,
-      "ssh_user": "atguigu",
-      "hive_host": "localhost",
-      "port": 10000,
-      "username": "atguigu"
-    },
     "new": {
       "use_ssh": true,
       "ssh_host": "172.20.10.6",
       "ssh_port": 22,
       "ssh_user": "atguigu",
-      "hive_host": "localhost",
-      "port": 10000,
-      "username": "atguigu",
       "beeline_url": "jdbc:hive2://localhost:10000/default"
+    },
+    "new_beeline": {
+      "use_ssh": false,
+      "beeline_url": "jdbc:hive2://xxxxxx:xxx,xxxxxxx:xxx,xxxxxxx:xxx/;serverdiscoverymode=zookeeper;zookeepernamespace=hiveserver2"
     }
+  },
+  "metastore_mysql": {
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore"
   },
   "validation_db": "validation_db",
   "tables": {
     "metrics_summary": "metrics_summary"
   },
-  "cluster_labels": {
-    "old": "old",
-    "new": "new"
-  },
-  "mysql": {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "***",
-    "database": "validation",
-    "compare_result_table": "compare_result"
-  },
-  "sql_templates": {
-    "hive_compare": "sql/hive_compare.sql",
-    "mysql_insert": "sql/mysql_insert_compare.sql"
-  },
-  "paths": {
-    "old_summary_csv": "output/old_summary.csv"
-  }
+  "default_csv": "/home/lkw/qianyi-project/new/input/old_summary.csv",
+  "default_sql": "/home/lkw/qianyi-project/new/sql/metrics_queries.sql",
+  "default_data_dt": "20250324"
 }
