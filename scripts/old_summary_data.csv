@@ -1,3 +1,0 @@
-table_name	check_type	metric_name	metric_expr	value	partition_spec	computed_at	data_dt
-gmall.dwd_trade_pv_inc	row_count_amount	row_count_amount	count(1), sum(amount)	1164,0	2024-01-01	2026-03-20 16:34:54.731	2024-01-01
-gmall.dwd_traffic_page_view_inc	row_count	row_count	count(1)	2523652488	2024-01-01	2026-03-20 16:35:38.197	2024-01-01

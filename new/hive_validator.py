@@ -12,18 +12,16 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 
 
 # ============== 通用函数 ==============
 
-def load_env_config(config_path: str = 'env_config.json') -> dict:
+def load_env_config(config_path: str) -> dict:
     """加载环境配置文件"""
-    config_file = os.path.join(os.path.dirname(__file__), config_path)
-    if not os.path.exists(config_file):
+    if not os.path.exists(config_path):
         return {}
-    with open(config_file, 'r', encoding='utf-8') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -542,92 +540,47 @@ def cmd_ingest_old(args):
     # 读取 CSV
     csv_path = args.csv
     if not csv_path:
-        # 默认路径：与 old 文件夹导出路径一致
-        today = datetime.now().strftime('%Y%m%d')
-        csv_path = f'/data/transfer_agent/data/upload/{today}/old_summary.csv'
-        print(f"使用默认 CSV 路径: {csv_path}")
+        # 从配置读取默认路径
+        csv_path = config.get('default_csv', 'input/old_summary.csv')
+        print(f"从配置读取默认 CSV 路径: {csv_path}")
 
-    if not os.path.isabs(csv_path):
-        # 如果提供了相对路径，则相对于当前工作目录
-        if not os.path.exists(csv_path):
-            # 如果当前目录找不到，则尝试相对于脚本目录查找
-            script_relative_path = os.path.join(os.path.dirname(__file__), csv_path)
-            if os.path.exists(script_relative_path):
-                csv_path = script_relative_path
-            else:
-                print(f"CSV 文件不存在: {csv_path}")
-                return 1
-    else:
-        if not os.path.exists(csv_path):
-            print(f"CSV 文件不存在: {csv_path}")
-            return 1
+    # 转换为绝对路径
+    if not os.path.exists(csv_path):
+        print(f"CSV 文件不存在: {csv_path}")
+        return 1
 
     # 创建表
     create_summary_table(validation_db, metrics_summary_table, cluster_config)
 
-    # 检查 CSV 是否有表头，并解析数据
-    expected_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
+    # 直接使用原始 CSV 文件
+    csv_to_use = csv_path
+    print(f"CSV 文件: {csv_to_use}")
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        first_line = f.readline().strip()
-        first_cols = first_line.split('\t')
-        has_header = all(col.lower() == expected_headers[i].lower() for i, col in enumerate(first_cols) if i < len(expected_headers))
+    if use_ssh:
+        # SSH 模式：上传到远程服务器
+        print(f"上传 CSV 文件到远程服务器")
+        remote_csv_path = upload_file_via_scp(csv_to_use, cluster_config)
+        if not remote_csv_path:
+            print("上传 CSV 文件失败")
+            return 1
 
-    # 读取 CSV 数据
-    csv_rows = []
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        if has_header:
-            next(f)  # 跳过表头
-        reader = csv.reader(f, delimiter='\t')
-        for row in reader:
-            if row:
-                csv_rows.append(row)
-
-    print(f"读取 CSV: {len(csv_rows)} 行数据")
-
-    if not csv_rows:
-        print("没有数据")
-        return 1
-
-    # 保存为临时 CSV 文件
-    temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-    temp_csv_path = temp_csv.name
-    temp_csv.close()
-
-    try:
-        with open(temp_csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f, delimiter='\t')
-            writer.writerows(csv_rows)
-        print(f"临时文件: {temp_csv_path}")
-
-        if use_ssh:
-            # SSH 模式：上传到远程服务器
-            print(f"上传 CSV 文件到远程服务器")
-            remote_csv_path = upload_file_via_scp(temp_csv_path, cluster_config)
-            if not remote_csv_path:
-                print("上传 CSV 文件失败")
-                return 1
-
-            try:
-                success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
-                if success:
-                    print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
-                else:
-                    print("LOAD DATA 执行失败")
-                    return 1
-            finally:
-                cleanup_remote_file(remote_csv_path, cluster_config)
-        else:
-            # Beeline 本地模式
-            success = execute_hive_load_data(cluster_config, temp_csv_path, validation_db, metrics_summary_table, args.overwrite)
+        try:
+            success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
             if success:
                 print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
             else:
                 print("LOAD DATA 执行失败")
                 return 1
-    finally:
-        if os.path.exists(temp_csv_path):
-            os.unlink(temp_csv_path)
+        finally:
+            cleanup_remote_file(remote_csv_path, cluster_config)
+    else:
+        # Beeline 本地模式
+        success = execute_hive_load_data(cluster_config, csv_to_use, validation_db, metrics_summary_table, args.overwrite)
+        if success:
+            print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+        else:
+            print("LOAD DATA 执行失败")
+            return 1
 
     print("\n完成!")
     return 0
@@ -652,20 +605,21 @@ def cmd_run_new(args):
 
     # 读取 SQL 文件
     sql_file = args.sql_file
-    if not os.path.isabs(sql_file):
-        # 如果提供了相对路径，则相对于当前工作目录
-        if not os.path.exists(sql_file):
-            # 如果当前目录找不到，则尝试相对于脚本目录查找
-            script_relative_path = os.path.join(os.path.dirname(__file__), sql_file)
-            if os.path.exists(script_relative_path):
-                sql_file = script_relative_path
-            else:
-                print(f"SQL 文件不存在: {sql_file}")
-                return 1
-    else:
-        if not os.path.exists(sql_file):
-            print(f"SQL 文件不存在: {sql_file}")
-            return 1
+    if not sql_file:
+        # 从配置读取默认路径
+        sql_file = config.get('default_sql', 'sql/metrics_queries.sql')
+        print(f"从配置读取默认 SQL 文件: {sql_file}")
+
+    # 转换为绝对路径
+    if not os.path.exists(sql_file):
+        print(f"SQL 文件不存在: {sql_file}")
+        return 1
+
+    # 分区日期
+    data_dt = args.data_dt
+    if not data_dt:
+        data_dt = config.get('default_data_dt', datetime.now().strftime('%Y%m%d'))
+        print(f"从配置读取默认分区日期: {data_dt}")
 
     with open(sql_file, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -682,7 +636,7 @@ def cmd_run_new(args):
     for i, stmt in enumerate(statements):
         print(f"\n执行第 {i+1} 条语句...")
 
-        actual_sql = replace_placeholder(stmt, args.data_dt)
+        actual_sql = replace_placeholder(stmt, data_dt)
 
         # 打印具体SQL内容
         print(f"SQL: {actual_sql}")
@@ -723,9 +677,6 @@ def cmd_run_new(args):
     # 导出 CSV
     if args.output_csv:
         output_csv = args.output_csv
-        if not os.path.isabs(output_csv):
-            output_csv = os.path.join(os.path.dirname(__file__), output_csv)
-
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
         with open(output_csv, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter='\t')
@@ -756,17 +707,14 @@ def cmd_run_all(args):
 
     # 读取 CSV
     csv_path = args.csv
+    # 读取 CSV
+    csv_path = args.csv
     if not csv_path:
-        # 默认路径：与 old 文件夹导出路径一致
-        today = datetime.now().strftime('%Y%m%d')
-        csv_path = f'/data/transfer_agent/data/upload/{today}/old_summary.csv'
-        print(f"使用默认 CSV 路径: {csv_path}")
+        # 从配置读取默认路径
+        csv_path = config.get('default_csv', 'input/old_summary.csv')
+        print(f"从配置读取默认 CSV 路径: {csv_path}")
 
-    if not os.path.isabs(csv_path):
-        script_relative_path = os.path.join(os.path.dirname(__file__), csv_path)
-        if os.path.exists(script_relative_path):
-            csv_path = script_relative_path
-
+    # 转换为绝对路径
     if not os.path.exists(csv_path):
         print(f"CSV 文件不存在: {csv_path}")
         return 1
@@ -774,87 +722,56 @@ def cmd_run_all(args):
     # 创建表
     create_summary_table(validation_db, metrics_summary_table, cluster_config)
 
-    # 检查 CSV 是否有表头
-    expected_headers = ['cluster', 'table_name', 'partition_col', 'metric_name', 'value', 'computed_at', 'data_dt']
+    # 直接使用原始 CSV 文件
     csv_to_use = csv_path
+    print(f"CSV 文件: {csv_to_use}")
 
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        first_line = f.readline().strip()
-        first_cols = first_line.split('\t')
-        has_header = all(col.lower() == expected_headers[i].lower() for i, col in enumerate(first_cols) if i < len(expected_headers))
+    if use_ssh:
+        # SSH 模式：上传到远程服务器
+        print(f"上传 CSV 文件到远程服务器")
+        remote_csv_path = upload_file_via_scp(csv_to_use, cluster_config)
+        if not remote_csv_path:
+            print("上传 CSV 文件失败")
+            return 1
 
-    if has_header:
-        print(f"检测到 CSV 包含表头，将跳过第一行")
-
-    # 读取 CSV 数据
-    csv_rows = []
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        if has_header:
-            next(f)  # 跳过表头
-        reader = csv.reader(f, delimiter='\t')
-        for row in reader:
-            if row:
-                csv_rows.append(row)
-
-    print(f"读取 CSV: {len(csv_rows)} 行数据")
-
-    if not csv_rows:
-        print("没有数据")
-        return 1
-
-    # 保存为临时 CSV 文件
-    temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-    temp_csv_path = temp_csv.name
-    temp_csv.close()
-
-    try:
-        with open(temp_csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f, delimiter='\t')
-            writer.writerows(csv_rows)
-        print(f"临时文件: {temp_csv_path}")
-
-        if use_ssh:
-            # SSH 模式：上传到远程服务器
-            print(f"上传 CSV 文件到远程服务器")
-            remote_csv_path = upload_file_via_scp(temp_csv_path, cluster_config)
-            if not remote_csv_path:
-                print("上传 CSV 文件失败")
-                return 1
-
-            try:
-                success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
-                if success:
-                    print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
-                else:
-                    print("LOAD DATA 执行失败")
-                    return 1
-            finally:
-                cleanup_remote_file(remote_csv_path, cluster_config)
-        else:
-            # Beeline 本地模式
-            success = execute_hive_load_data(cluster_config, temp_csv_path, validation_db, metrics_summary_table, args.overwrite)
+        try:
+            success = execute_hive_load_data(cluster_config, remote_csv_path, validation_db, metrics_summary_table, args.overwrite)
             if success:
                 print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
             else:
                 print("LOAD DATA 执行失败")
                 return 1
-    finally:
-        if os.path.exists(temp_csv_path):
-            os.unlink(temp_csv_path)
+        finally:
+            cleanup_remote_file(remote_csv_path, cluster_config)
+    else:
+        # Beeline 本地模式
+        success = execute_hive_load_data(cluster_config, csv_to_use, validation_db, metrics_summary_table, args.overwrite)
+        if success:
+            print("CSV 数据已通过 LOAD DATA 成功载入 Hive 表")
+        else:
+            print("LOAD DATA 执行失败")
+            return 1
 
     print(f"========== 步骤 1 完成 ==========\n")
 
     print(f"========== 步骤 2: run-new ==========")
     # 读取 SQL 文件
     sql_file = args.sql_file
-    if not os.path.isabs(sql_file):
-        script_relative_path = os.path.join(os.path.dirname(__file__), sql_file)
-        if os.path.exists(script_relative_path):
-            sql_file = script_relative_path
+    if not sql_file:
+        # 从配置读取默认路径
+        sql_file = config.get('default_sql', 'sql/metrics_queries.sql')
+        print(f"从配置读取默认 SQL 文件: {sql_file}")
 
+    # 转换为绝对路径
     if not os.path.exists(sql_file):
         print(f"SQL 文件不存在: {sql_file}")
         return 1
+
+    # 分区日期
+    data_dt = args.data_dt
+    if not data_dt:
+        data_dt = config.get('default_data_dt', datetime.now().strftime('%Y%m%d'))
+        print(f"从配置读取默认分区日期: {data_dt}")
 
     with open(sql_file, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -868,7 +785,7 @@ def cmd_run_all(args):
     for i, stmt in enumerate(statements):
         print(f"\n执行第 {i+1} 条语句...")
 
-        actual_sql = replace_placeholder(stmt, args.data_dt)
+        actual_sql = replace_placeholder(stmt, data_dt)
         print(f"SQL: {actual_sql}")
 
         headers, rows = execute_hive_query(actual_sql, cluster_config)
@@ -907,9 +824,6 @@ def cmd_run_all(args):
     # 导出 CSV
     if args.output_csv:
         output_csv = args.output_csv
-        if not os.path.isabs(output_csv):
-            output_csv = os.path.join(os.path.dirname(__file__), output_csv)
-
         os.makedirs(os.path.dirname(output_csv), exist_ok=True)
         with open(output_csv, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter='\t')
@@ -944,23 +858,23 @@ def main():
 
     # ingest-old 子命令
     parser_ingest = subparsers.add_parser('ingest-old', help='从旧集群 CSV 读取并通过 LOAD DATA 写入 Hive 统一结果表（带 cluster=old 字段）')
-    parser_ingest.add_argument('--csv', required=True, help='旧集群导出的 CSV 文件路径')
+    parser_ingest.add_argument('--csv', help='旧集群导出的 CSV 文件路径（默认从配置读取）')
     parser_ingest.add_argument('--cluster', default='new', help='目标集群')
     parser_ingest.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
 
     # run-new 子命令
     parser_run = subparsers.add_parser('run-new', help='新集群执行相同语句并通过 LOAD DATA 写入同一张表（带 cluster=new 字段）')
-    parser_run.add_argument('--sql-file', default='output/metrics_queries.sql', help='SQL 文件路径')
-    parser_run.add_argument('--data-dt', required=True, help='分区日期')
+    parser_run.add_argument('--sql-file', help='SQL 文件路径（默认从配置读取）')
+    parser_run.add_argument('--data-dt', help='分区日期（默认从配置读取）')
     parser_run.add_argument('--cluster', default='new', help='集群名称')
     parser_run.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
     parser_run.add_argument('--output-csv', help='输出 CSV 文件路径（可选）')
 
     # run-all 子命令
     parser_all = subparsers.add_parser('run-all', help='依次执行 ingest-old 和 run-new')
-    parser_all.add_argument('--csv', required=True, help='旧集群导出的 CSV 文件路径')
-    parser_all.add_argument('--sql-file', default='sql/metrics_queries.sql', help='SQL 文件路径')
-    parser_all.add_argument('--data-dt', required=True, help='分区日期')
+    parser_all.add_argument('--csv', help='旧集群导出的 CSV 文件路径（默认从配置读取）')
+    parser_all.add_argument('--sql-file', help='SQL 文件路径（默认从配置读取）')
+    parser_all.add_argument('--data-dt', help='分区日期（默认从配置读取）')
     parser_all.add_argument('--cluster', default='new', help='集群名称')
     parser_all.add_argument('--overwrite', action='store_true', help='覆盖已有数据')
     parser_all.add_argument('--output-csv', help='输出 CSV 文件路径（可选）')

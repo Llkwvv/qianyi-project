@@ -1,6 +1,13 @@
 {
   "metastore_mysql": {
-    "host": "172.20.10.2",
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore"
+  },
+  "import_mysql": {
+    "host": "172.20.10.6",
     "port": 3306,
     "user": "root",
     "password": "000000",
@@ -20,5 +27,8 @@
   "validation_db": "validation_db",
   "paths": {
     "old_summary": "output/old_summary.csv"
+  },
+  "table_stats": {
+    "output_dir": "output"
   }
 }
