@@ -20,7 +20,10 @@ def load_env_config(config_path: str = 'env_config.json') -> dict:
 
 
 def get_table_stats(mysql_config: dict, data_dt: str):
-    """从 MySQL 获取 Hive 表统计信息，自动获取每个表的分区字段名"""
+    """从 MySQL 获取 Hive 表统计信息
+    1. 非分区表：直接获取表级别统计信息
+    2. 分区表：获取特定分区（如 dt=20250324）的统计数据
+    """
     try:
         import pymysql
     except ImportError:
@@ -44,15 +47,21 @@ def get_table_stats(mysql_config: dict, data_dt: str):
     else:
         date_pattern = data_dt
 
-    # 查询指定日期分区的表统计信息
-    # 从 PARTITION_KEYS 表获取每个表的第一个分区字段名（INTEGER_IDX=0）
-    # 包括非分区表（没有分区记录的表）
+    # 需求：
+    # 1. 非分区表数据
+    # 2. 分区表且特定分区（如 dt=20250324）有数据
+    # 3. 不要分区表但特定分区为空的数据
+
+    # 使用 UNION ALL 合并两类数据：
+    # 1. 非分区表（没有分区键的表）
+    # 2. 分区表中有特定分区的数据
     sql = f"""
+    -- 1. 非分区表：没有分区键的表
     SELECT
         d.NAME as database_name,
         t.TBL_NAME as table_name,
         t.TBL_TYPE as table_type,
-        p.PART_NAME as partition_name,
+        '' as partition_name,
         tp_num_rows.PARAM_VALUE as num_rows,
         tp_total_size.PARAM_VALUE as total_size,
         tp_num_files.PARAM_VALUE as num_files,
@@ -61,13 +70,35 @@ def get_table_stats(mysql_config: dict, data_dt: str):
         '{data_dt}' as data_dt
     FROM TBLS t
     JOIN DBS d ON t.DB_ID = d.DB_ID
-    LEFT JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID
-    LEFT JOIN PARTITION_KEYS pk ON t.TBL_ID = pk.TBL_ID AND pk.INTEGER_IDX = 0
+    LEFT JOIN PARTITION_KEYS pk ON t.TBL_ID = pk.TBL_ID
     LEFT JOIN TABLE_PARAMS tp_num_rows ON t.TBL_ID = tp_num_rows.TBL_ID AND tp_num_rows.PARAM_KEY = 'numRows'
     LEFT JOIN TABLE_PARAMS tp_total_size ON t.TBL_ID = tp_total_size.TBL_ID AND tp_total_size.PARAM_KEY = 'totalSize'
     LEFT JOIN TABLE_PARAMS tp_num_files ON t.TBL_ID = tp_num_files.TBL_ID AND tp_num_files.PARAM_KEY = 'numFiles'
     LEFT JOIN TABLE_PARAMS tp_raw_size ON t.TBL_ID = tp_raw_size.TBL_ID AND tp_raw_size.PARAM_KEY = 'rawDataSize'
-    WHERE p.PART_NAME LIKE CONCAT(pk.PKEY_NAME, '=%{date_pattern}%') OR p.PART_NAME IS NULL
+    WHERE pk.TBL_ID IS NULL
+
+    UNION ALL
+
+    -- 2. 分区表中有特定分区的数据（日期可能在任意一级分区）
+    SELECT
+        d.NAME as database_name,
+        t.TBL_NAME as table_name,
+        t.TBL_TYPE as table_type,
+        p.PART_NAME as partition_name,
+        pp_num_rows.PARAM_VALUE as num_rows,
+        pp_total_size.PARAM_VALUE as total_size,
+        pp_num_files.PARAM_VALUE as num_files,
+        pp_raw_size.PARAM_VALUE as raw_data_size,
+        p.LAST_ACCESS_TIME as last_access_time,
+        '{data_dt}' as data_dt
+    FROM TBLS t
+    JOIN DBS d ON t.DB_ID = d.DB_ID
+    JOIN PARTITIONS p ON t.TBL_ID = p.TBL_ID
+    LEFT JOIN PARTITION_PARAMS pp_num_rows ON p.PART_ID = pp_num_rows.PART_ID AND pp_num_rows.PARAM_KEY = 'numRows'
+    LEFT JOIN PARTITION_PARAMS pp_total_size ON p.PART_ID = pp_total_size.PART_ID AND pp_total_size.PARAM_KEY = 'totalSize'
+    LEFT JOIN PARTITION_PARAMS pp_num_files ON p.PART_ID = pp_num_files.PART_ID AND pp_num_files.PARAM_KEY = 'numFiles'
+    LEFT JOIN PARTITION_PARAMS pp_raw_size ON p.PART_ID = pp_raw_size.PART_ID AND pp_raw_size.PARAM_KEY = 'rawDataSize'
+    WHERE p.PART_NAME LIKE CONCAT('%=', '{date_pattern}', '%')
     """
 
     cursor.execute(sql)
@@ -87,6 +118,11 @@ def main():
         '--data-dt',
         required=True,
         help='分区日期，如 20250324'
+    )
+    parser.add_argument(
+        '--cluster',
+        required=True,
+        help='集群名称，用于输出文件名，如 old 或 new'
     )
     parser.add_argument(
         '--output-csv',
@@ -122,12 +158,8 @@ def main():
 
     # 输出路径
     if not args.output_csv:
-        table_stats_config = config.get('table_stats', {})
-        output_dir = table_stats_config.get('output_dir')
-        if not output_dir:
-            print("错误: 请通过配置文件或命令行提供输出目录")
-            return
-        args.output_csv = os.path.join(output_dir, f'{datetime.date.today().strftime("%Y%m%d")}/{args.data_dt}_old_table_stats.csv')
+        csv_dir = config.get('csv_dir', 'output')
+        args.output_csv = os.path.join(csv_dir, f'{datetime.date.today().strftime("%Y%m%d")}/{args.data_dt}_{args.cluster}_table_stats.csv')
 
     # 命令行参数覆盖配置
     if args.mysql_host:

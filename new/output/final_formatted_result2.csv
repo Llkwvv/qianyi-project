@@ -1,5 +1,0 @@
-database_name,table_name,partition_name,status,指标名,指标old值,指标new值,data_dt
-gmall,dwd_traffic_page_view_inc,,only_in_old,num_rows,2500,,20221111
-gmall,new_table_test,,only_in_new,num_rows,,500,20221111
-gmall,dwd_traffic_action_inc,dt=2022-11-11,difference,num_rows,2000,2200,20221111
-gmall,dim_province_full,dt=2022-11-11,difference,num_rows,1000,1200,20221111

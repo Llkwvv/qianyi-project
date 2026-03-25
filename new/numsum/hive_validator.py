@@ -525,8 +525,9 @@ def cleanup_remote_file(remote_file: str, ssh_config: dict) -> bool:
 def cmd_ingest_old(args):
     """从旧集群 CSV 读取并通过 LOAD DATA 写入 Hive 统一结果表（带 cluster=old 字段）"""
     config = load_env_config(args.config)
-    validation_db = config.get('validation_db', 'validation_db')
-    metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
+    insert_mysql = config.get('insert_mysql', {})
+    validation_db = insert_mysql.get('db', 'validation_db')
+    metrics_summary_table = 'metrics_summary'
 
     cluster_config = get_cluster_config(config, args.cluster)
     use_ssh = cluster_config.get('use_ssh', True)
@@ -541,7 +542,8 @@ def cmd_ingest_old(args):
     csv_path = args.csv
     if not csv_path:
         # 从配置读取默认路径
-        csv_path = config.get('default_csv', 'input/old_summary.csv')
+        csv_dir = config.get('csv_dir', 'input')
+        csv_path = os.path.join(csv_dir, 'old_summary.csv')
         print(f"从配置读取默认 CSV 路径: {csv_path}")
 
     # 转换为绝对路径
@@ -591,8 +593,9 @@ def cmd_ingest_old(args):
 def cmd_run_new(args):
     """新集群执行相同语句并通过 LOAD DATA 写入同一张表（带 cluster=new 字段）"""
     config = load_env_config(args.config)
-    validation_db = config.get('validation_db', 'validation_db')
-    metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
+    insert_mysql = config.get('insert_mysql', {})
+    validation_db = insert_mysql.get('db', 'validation_db')
+    metrics_summary_table = 'metrics_summary'
 
     cluster_config = get_cluster_config(config, args.cluster)
     use_ssh = cluster_config.get('use_ssh', True)
@@ -606,9 +609,8 @@ def cmd_run_new(args):
     # 读取 SQL 文件
     sql_file = args.sql_file
     if not sql_file:
-        # 从配置读取默认路径
-        sql_file = config.get('default_sql', 'sql/metrics_queries.sql')
-        print(f"从配置读取默认 SQL 文件: {sql_file}")
+        print("错误: 请通过 --sql-file 参数指定 SQL 文件路径")
+        return 1
 
     # 转换为绝对路径
     if not os.path.exists(sql_file):
@@ -618,8 +620,8 @@ def cmd_run_new(args):
     # 分区日期
     data_dt = args.data_dt
     if not data_dt:
-        data_dt = config.get('default_data_dt', datetime.now().strftime('%Y%m%d'))
-        print(f"从配置读取默认分区日期: {data_dt}")
+        print("错误: 请通过 --data-dt 参数指定分区日期")
+        return 1
 
     with open(sql_file, 'r', encoding='utf-8') as f:
         content = f.read()
@@ -692,8 +694,9 @@ def cmd_run_new(args):
 def cmd_run_all(args):
     """依次执行 ingest-old 和 run-new"""
     config = load_env_config(args.config)
-    validation_db = config.get('validation_db', 'validation_db')
-    metrics_summary_table = config.get('tables', {}).get('metrics_summary', 'metrics_summary')
+    insert_mysql = config.get('insert_mysql', {})
+    validation_db = insert_mysql.get('db', 'validation_db')
+    metrics_summary_table = 'metrics_summary'
 
     cluster_config = get_cluster_config(config, args.cluster)
     use_ssh = cluster_config.get('use_ssh', True)
@@ -707,11 +710,10 @@ def cmd_run_all(args):
 
     # 读取 CSV
     csv_path = args.csv
-    # 读取 CSV
-    csv_path = args.csv
     if not csv_path:
         # 从配置读取默认路径
-        csv_path = config.get('default_csv', 'input/old_summary.csv')
+        csv_dir = config.get('csv_dir', 'input')
+        csv_path = os.path.join(csv_dir, 'old_summary.csv')
         print(f"从配置读取默认 CSV 路径: {csv_path}")
 
     # 转换为绝对路径
@@ -758,9 +760,8 @@ def cmd_run_all(args):
     # 读取 SQL 文件
     sql_file = args.sql_file
     if not sql_file:
-        # 从配置读取默认路径
-        sql_file = config.get('default_sql', 'sql/metrics_queries.sql')
-        print(f"从配置读取默认 SQL 文件: {sql_file}")
+        print("错误: 请通过 --sql-file 参数指定 SQL 文件路径")
+        return 1
 
     # 转换为绝对路径
     if not os.path.exists(sql_file):
@@ -770,8 +771,8 @@ def cmd_run_all(args):
     # 分区日期
     data_dt = args.data_dt
     if not data_dt:
-        data_dt = config.get('default_data_dt', datetime.now().strftime('%Y%m%d'))
-        print(f"从配置读取默认分区日期: {data_dt}")
+        print("错误: 请通过 --data-dt 参数指定分区日期")
+        return 1
 
     with open(sql_file, 'r', encoding='utf-8') as f:
         content = f.read()

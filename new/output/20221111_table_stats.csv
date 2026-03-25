@@ -1,5 +1,0 @@
-gmall,dim_province_full,MANAGED_TABLE,dt=2022-11-11,,,,,0
-gmall,dim_sku_full,MANAGED_TABLE,dt=2022-11-11,,,,,0
-gmall,dwd_traffic_action_inc,MANAGED_TABLE,dt=2022-11-11,,,,,0
-gmall,dwd_traffic_page_view_inc,MANAGED_TABLE,dt=2022-11-11,,,,,0
-gmall,ods_log_inc,EXTERNAL_TABLE,dt=2022-11-11,,,,,0

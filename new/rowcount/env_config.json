@@ -1,0 +1,17 @@
+{
+  "metastore_mysql": {
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore"
+  },
+  "insert_mysql": {
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "validation_db"
+  },
+  "csv_dir": "/home/lkw/qianyi-project/new/input"
+}
