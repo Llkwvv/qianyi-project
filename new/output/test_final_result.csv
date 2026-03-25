@@ -1,0 +1,5 @@
+database_name,table_name,partition_name,status,old_num_rows,old_total_size,old_num_files,old_raw_data_size,new_num_rows,new_total_size,new_num_files,new_raw_data_size,diff_num_rows,diff_total_size,diff_num_files,diff_raw_data_size
+gmall,dwd_traffic_page_view_inc,dt=2022-11-11,only_in_old,2500,256000,25,128000,,,,,,,,
+gmall,new_table_test,dt=2022-11-11,only_in_new,,,,,500,51200,5,25600,,,,
+gmall,dim_province_full,dt=2022-11-11,difference,1000,102400,10,51200,1200,122880,12,61440,200,20480,2,10240
+gmall,dwd_traffic_action_inc,dt=2022-11-11,difference,2000,204800,20,102400,2200,225280,22,112640,200,20480,2,10240

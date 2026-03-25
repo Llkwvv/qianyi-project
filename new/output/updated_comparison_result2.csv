@@ -1,0 +1,5 @@
+database_name,table_name,partition_name,status,old_num_rows,new_num_rows,diff_num_rows
+gmall,dwd_traffic_page_view_inc,,only_in_old,2500,,
+gmall,new_table_test,,only_in_new,,500,
+gmall,dim_province_full,dt=2022-11-11,difference,1000,1200,200
+gmall,dwd_traffic_action_inc,dt=2022-11-11,difference,2000,2200,200
