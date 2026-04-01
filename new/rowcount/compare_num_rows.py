@@ -167,19 +167,27 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # Hive表字段定义
+    # Hive表字段定义（注意：data_dt是分区字段，不出现在CSV中）
     fieldnames = [
         'database_name', 'table_name', 'partition_name',
         'metric_name', 'old_value', 'new_value', 'diff_value',
-        'data_dt', 'compare_date'
+        'compare_date'
     ]
 
     # 添加额外的字段
     today = datetime.date.today().strftime('%Y%m%d')
     enriched_differences = []
     for diff in differences:
-        enriched_diff = diff.copy()
-        enriched_diff['compare_date'] = today  # 对比日期
+        enriched_diff = {
+            'database_name': diff['database_name'],
+            'table_name': diff['table_name'],
+            'partition_name': diff['partition_name'],
+            'metric_name': diff['metric_name'],
+            'old_value': diff['old_value'],
+            'new_value': diff['new_value'],
+            'diff_value': diff['diff_value'],
+            'compare_date': today  # 对比日期
+        }
         enriched_differences.append(enriched_diff)
 
     # 写入CSV文件（Hive格式，需要指定NULL值的表示方式）
@@ -217,7 +225,7 @@ def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
 
         print(f"执行Hive命令...")
         cmd = ["hive", "-e", load_data_sql]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         if result.returncode != 0:
             print(f"Hive命令执行失败: {result.stderr}")
@@ -229,7 +237,7 @@ def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
         # 验证数据加载
         count_sql = f"SELECT COUNT(*) FROM {hive_database}.{hive_table} WHERE data_dt='{data_dt}'"
         count_cmd = ["hive", "-e", count_sql]
-        count_result = subprocess.run(count_cmd, capture_output=True, text=True)
+        count_result = subprocess.run(count_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         if count_result.returncode == 0:
             print(f"加载到Hive的数据行数: {count_result.stdout.strip()}")
@@ -259,11 +267,11 @@ def main():
     output_dir = csv_dir
 
     # 自动拼接文件路径
-    today = datetime.date.today().strftime('%Y%m%d')
+    today = args.data_dt
     if not args.old_csv:
-        args.old_csv = os.path.join(csv_dir, f'{today}/{args.data_dt}_old_table_stats.csv')
+        args.old_csv = os.path.join(csv_dir, f'{args.data_dt}/{args.data_dt}_old_table_stats.csv')
     if not args.new_csv:
-        args.new_csv = os.path.join(csv_dir, f'{today}/{args.data_dt}_new_table_stats.csv')
+        args.new_csv = os.path.join(csv_dir, f'{args.data_dt}/{args.data_dt}_new_table_stats.csv')
 
     print(f"旧集群CSV: {args.old_csv}")
     print(f"新集群CSV: {args.new_csv}")
@@ -331,7 +339,7 @@ def main():
 
     # 导出到CSV文件
     print(f"\n正在导出结果到CSV...")
-    output_csv = os.path.join(output_dir, f'{today}/{args.data_dt}_table_comparison.csv')
+    output_csv = os.path.join(output_dir, f'{args.data_dt}/{args.data_dt}_table_comparison.csv')
     csv_file = export_to_hive_csv(differences, output_csv)
 
     if csv_file:
