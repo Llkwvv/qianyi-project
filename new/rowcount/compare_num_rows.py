@@ -255,8 +255,8 @@ def main():
     config = load_env_config()
     csv_dir = config.get('csv_dir')
 
-    # 设置输出目录
-    output_dir = args.output_dir or csv_dir
+    # 输出目录使用csv_dir
+    output_dir = csv_dir
 
     # 自动拼接文件路径
     today = datetime.date.today().strftime('%Y%m%d')
