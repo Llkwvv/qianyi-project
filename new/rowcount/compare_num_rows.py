@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-import pymysql
+import subprocess
 from typing import Dict, List
 import datetime
 
@@ -31,75 +31,133 @@ def read_csv_data(file_path: str) -> List[Dict]:
 
 def compare_num_rows(old_data: List[Dict], new_data: List[Dict]) -> List[Dict]:
     """将两个集群的数据拼接，计算差值，返回所有数据（不区分是否有差异）"""
-    # 构建以 (database_name, table_name) 为键的字典
-    old_dict = {}
-    new_dict = {}
-
-    for row in old_data:
-        key = (row['database_name'], row['table_name'])
-        old_dict[key] = row
-
-    for row in new_data:
-        key = (row['database_name'], row['table_name'])
-        new_dict[key] = row
 
     results = []
-    all_keys = set(old_dict.keys()) | set(new_dict.keys())
+
+    # 创建查找表，使用(database_name, table_name, partition_name)作为键
+    old_lookup = {}
+    new_lookup = {}
+
+    # 为旧数据建立查找表
+    for row in old_data:
+        key = (row['database_name'], row['table_name'], row.get('partition_name') or '')
+        if key not in old_lookup:
+            old_lookup[key] = []
+        old_lookup[key].append(row)
+
+    # 为新数据建立查找表
+    for row in new_data:
+        key = (row['database_name'], row['table_name'], row.get('partition_name') or '')
+        if key not in new_lookup:
+            new_lookup[key] = []
+        new_lookup[key].append(row)
+
+    # 处理所有唯一的(database_name, table_name, partition_name)组合
+    all_keys = set(old_lookup.keys()) | set(new_lookup.keys())
 
     for key in all_keys:
-        old_row = old_dict.get(key)
-        new_row = new_dict.get(key)
+        old_rows = old_lookup.get(key, [])
+        new_rows = new_lookup.get(key, [])
 
-        # 获取两边的值（表不存在时用 None 表示，否则转换为 int）
-        def to_int_or_none(value):
-            if value is None or value == '':
-                return None
-            try:
-                return int(value)
-            except:
-                return None
+        # 如果两边都有数据，则进行交叉对比
+        if old_rows and new_rows:
+            # 为每对记录创建对比结果
+            for old_row in old_rows:
+                for new_row in new_rows:
+                    # 获取数值
+                    def to_int_or_none(value):
+                        if value is None or value == '':
+                            return None
+                        try:
+                            return int(value)
+                        except:
+                            return None
 
-        old_num_rows = to_int_or_none(old_row['num_rows']) if old_row else None
-        new_num_rows = to_int_or_none(new_row['num_rows']) if new_row else None
+                    old_num_rows = to_int_or_none(old_row['num_rows'])
+                    new_num_rows = to_int_or_none(new_row['num_rows'])
 
-        # 计算差值（None 视为 0）
-        def safe_int(value):
-            try:
-                return int(value) if value else 0
-            except:
-                return 0
+                    # 计算差值
+                    def safe_int(value):
+                        try:
+                            return int(value) if value else 0
+                        except:
+                            return 0
 
-        diff_value = safe_int(new_num_rows) - safe_int(old_num_rows)
+                    diff_value = safe_int(new_num_rows) - safe_int(old_num_rows)
 
-        # 获取分区名（优先用旧的）
-        partition_name = None
-        if old_row:
-            partition_name = old_row.get('partition_name') or None
-        elif new_row:
-            partition_name = new_row.get('partition_name') or None
+                    # 获取分区名（从key中获取）
+                    partition_name = key[2] if key[2] else None
 
-        # 获取 data_dt
-        data_dt = None
-        if old_row:
-            data_dt = old_row.get('data_dt') or None
-        elif new_row:
-            data_dt = new_row.get('data_dt') or None
+                    # 获取 data_dt（优先用旧的）
+                    data_dt = old_row.get('data_dt') or new_row.get('data_dt') or None
 
-        results.append({
-            'database_name': key[0],
-            'table_name': key[1],
-            'partition_name': partition_name,
-            'metric_name': 'num_rows',
-            'old_value': old_num_rows,
-            'new_value': new_num_rows,
-            'diff_value': diff_value,
-            'data_dt': data_dt
-        })
+                    results.append({
+                        'database_name': key[0],
+                        'table_name': key[1],
+                        'partition_name': partition_name,
+                        'metric_name': 'num_rows',
+                        'old_value': old_num_rows,
+                        'new_value': new_num_rows,
+                        'diff_value': diff_value,
+                        'data_dt': data_dt
+                    })
+        elif old_rows:
+            # 只存在于旧集群中的记录
+            for old_row in old_rows:
+                def to_int_or_none(value):
+                    if value is None or value == '':
+                        return None
+                    try:
+                        return int(value)
+                    except:
+                        return None
+
+                old_num_rows = to_int_or_none(old_row['num_rows'])
+
+                # 获取分区名（从key中获取）
+                partition_name = key[2] if key[2] else None
+
+                results.append({
+                    'database_name': key[0],
+                    'table_name': key[1],
+                    'partition_name': partition_name,
+                    'metric_name': 'num_rows',
+                    'old_value': old_num_rows,
+                    'new_value': None,
+                    'diff_value': 0 - (old_num_rows or 0),
+                    'data_dt': old_row.get('data_dt') or None
+                })
+        else:
+            # 只存在于新集群中的记录
+            for new_row in new_rows:
+                def to_int_or_none(value):
+                    if value is None or value == '':
+                        return None
+                    try:
+                        return int(value)
+                    except:
+                        return None
+
+                new_num_rows = to_int_or_none(new_row['num_rows'])
+
+                # 获取分区名（从key中获取）
+                partition_name = key[2] if key[2] else None
+
+                results.append({
+                    'database_name': key[0],
+                    'table_name': key[1],
+                    'partition_name': partition_name,
+                    'metric_name': 'num_rows',
+                    'old_value': None,
+                    'new_value': new_num_rows,
+                    'diff_value': (new_num_rows or 0) - 0,
+                    'data_dt': new_row.get('data_dt') or None
+                })
 
     return results
 
-def export_to_csv(differences: List[Dict], output_file: str):
-    """导出差异到CSV文件"""
+def export_to_hive_csv(differences: List[Dict], output_file: str):
+    """导出对比结果到CSV文件（Hive格式）"""
     if not differences:
         print("没有发现差异")
         return
@@ -109,90 +167,111 @@ def export_to_csv(differences: List[Dict], output_file: str):
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # 写入CSV文件
-    fieldnames = ['database_name', 'table_name', 'partition_name',
-                  'metric_name', 'old_value', 'new_value', 'diff_value', 'data_dt']
+    # Hive表字段定义
+    fieldnames = [
+        'database_name', 'table_name', 'partition_name',
+        'metric_name', 'old_value', 'new_value', 'diff_value',
+        'data_dt', 'compare_date', 'cluster_type'
+    ]
 
+    # 添加额外的字段
+    today = datetime.date.today().strftime('%Y%m%d')
+    enriched_differences = []
+    for diff in differences:
+        enriched_diff = diff.copy()
+        enriched_diff['compare_date'] = today  # 对比日期
+        enriched_diff['cluster_type'] = 'table_comparison'  # 集群类型标识
+        enriched_differences.append(enriched_diff)
+
+    # 写入CSV文件（Hive格式，需要指定NULL值的表示方式）
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(differences)
+        for diff in enriched_differences:
+            # 将None转换为空字符串，这样Hive可以解析为NULL
+            row = {k: ('' if v is None else str(v)) for k, v in diff.items()}
+            writer.writerow(row)
 
-    print(f"行数差异报告已导出到: {output_file}")
+    print(f"行数对比结果已导出到CSV: {output_file}")
+    return output_file
 
-def get_mysql_config(config: dict, cluster_name: str) -> dict:
-    """获取指定集群的MySQL配置"""
-    # 严格使用 metastore_mysql 配置
-    if 'metastore_mysql' not in config:
-        raise ValueError("配置文件缺少 metastore_mysql 配置")
-    return config['metastore_mysql'].copy()
+def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
+    """将CSV文件加载到Hive表（简化版本）"""
+    if not os.path.exists(csv_file):
+        print(f"错误: CSV文件不存在 {csv_file}")
+        return False
 
-def insert_comparison_results(mysql_config: dict, differences: List[Dict], data_dt: str):
-    """将对比结果插入MySQL表（先删除相同data_dt的数据）"""
+    hive_database = hive_config.get('database', 'default')
+    hive_table = hive_config.get('table', 'table_comparison')
+    hdfs_base_path = hive_config.get('hdfs_path', '/user/hive/warehouse')
+    hdfs_target_path = f"{hdfs_base_path}/{hive_database}.db/{hive_table}/data_dt={data_dt}"
+
     try:
-        conn = pymysql.connect(
-            host=mysql_config['host'],
-            port=mysql_config['port'],
-            user=mysql_config['user'],
-            password=mysql_config['password'],
-            database=mysql_config.get('database') or mysql_config.get('db'),
-            charset='utf8mb4'
-        )
+        print(f"准备将CSV文件加载到Hive...")
+        print(f"CSV文件: {csv_file}")
+        print(f"Hive表: {hive_database}.{hive_table}")
+        print(f"HDFS路径: {hdfs_target_path}")
 
-        cursor = conn.cursor()
-
-        # 先删除相同 data_dt 的数据
-        delete_sql = "DELETE FROM table_comparison WHERE data_dt = %s"
-        cursor.execute(delete_sql, (data_dt,))
-        deleted_count = cursor.rowcount
-        print(f"已删除 {deleted_count} 条相同 data_dt 的旧数据")
-
-        # 插入数据（使用英文列名）
-        insert_sql = """
-        INSERT INTO table_comparison (
-            database_name, table_name, partition_name,
-            metric_name, old_value, new_value, diff_value, data_dt
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        # 1. 添加分区（如果分区不存在）
+        add_partition_sql = f"""
+        ALTER TABLE {hive_database}.{hive_table}
+        ADD IF NOT EXISTS PARTITION (data_dt='{data_dt}')
+        LOCATION '{hdfs_target_path}'
         """
 
-        for diff in differences:
-            # None 会被 pymysql 正确转换为 MySQL 的 NULL
-            cursor.execute(insert_sql, (
-                diff['database_name'],
-                diff['table_name'],
-                diff['partition_name'],
-                diff['metric_name'],
-                diff['old_value'],
-                diff['new_value'],
-                diff.get('diff_value', 0),
-                diff.get('data_dt')
-            ))
+        # 2. 加载数据到分区（使用LOAD DATA）
+        load_data_sql = f"""
+        LOAD DATA LOCAL INPATH '{csv_file}'
+        OVERWRITE INTO TABLE {hive_database}.{hive_table}
+        PARTITION (data_dt='{data_dt}')
+        """
 
-        conn.commit()
-        cursor.close()
-        conn.close()
+        # 执行Hive命令
+        hive_cmd = f"{add_partition_sql}; {load_data_sql}"
+        print(f"执行Hive命令...")
 
-        print(f"成功插入 {len(differences)} 条行数对比记录到数据库")
+        # 使用hive -e执行SQL
+        cmd = ["hive", "-e", hive_cmd]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            print(f"Hive命令执行失败: {result.stderr}")
+            return False
+
+        print(f"数据已成功加载到Hive表: {hive_database}.{hive_table}")
+        print(f"分区: data_dt={data_dt}")
+
+        # 验证数据加载
+        count_sql = f"SELECT COUNT(*) FROM {hive_database}.{hive_table} WHERE data_dt='{data_dt}'"
+        count_cmd = ["hive", "-e", count_sql]
+        count_result = subprocess.run(count_cmd, capture_output=True, text=True)
+
+        if count_result.returncode == 0:
+            print(f"加载到Hive的数据行数: {count_result.stdout.strip()}")
+
+        return True
 
     except Exception as e:
-        print(f"插入行数对比结果时出错: {e}")
+        print(f"加载到Hive时出错: {e}")
+        return False
 
 def main():
-    parser = argparse.ArgumentParser(description='仅比较两个集群的表行数差异')
+    parser = argparse.ArgumentParser(description='比较两个集群的表行数差异并导出到CSV/Hive')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 20250324')
     parser.add_argument('--old-csv', help='旧集群CSV文件路径（可选，默认从csv_dir读取）')
     parser.add_argument('--new-csv', help='新集群CSV文件路径（可选，默认从csv_dir读取）')
-    parser.add_argument('--mysql-host', help='MySQL主机地址')
-    parser.add_argument('--mysql-port', type=int, help='MySQL端口')
-    parser.add_argument('--mysql-user', help='MySQL用户名')
-    parser.add_argument('--mysql-password', help='MySQL密码')
-    parser.add_argument('--mysql-database', help='元数据库名称')
+    parser.add_argument('--output-dir', help='输出目录（可选，默认从csv_dir读取）')
+    parser.add_argument('--hive-table', help='Hive表名（可选，默认从配置读取）')
+    parser.add_argument('--skip-hive', action='store_true', help='跳过Hive加载步骤')
 
     args = parser.parse_args()
 
     # 加载配置
     config = load_env_config()
     csv_dir = config.get('csv_dir', 'output')
+
+    # 设置输出目录
+    output_dir = args.output_dir or csv_dir
 
     # 自动拼接文件路径
     today = datetime.date.today().strftime('%Y%m%d')
@@ -203,32 +282,7 @@ def main():
 
     print(f"旧集群CSV: {args.old_csv}")
     print(f"新集群CSV: {args.new_csv}")
-
-    # 严格使用 insert_mysql 配置（不进行回退）
-    if 'insert_mysql' not in config:
-        print("错误: 配置文件缺少 insert_mysql 配置，无法导出数据")
-        print("配置示例:")
-        print('  {"insert_mysql": {"host": "localhost", "port": 3306, "user": "root", "password": "xxx", "db": "validation_db"}}')
-        return
-    mysql_config = config['insert_mysql'].copy()
-
-    # 命令行参数覆盖配置
-    if args.mysql_host:
-        mysql_config['host'] = args.mysql_host
-    if args.mysql_port:
-        mysql_config['port'] = args.mysql_port
-    if args.mysql_user:
-        mysql_config['user'] = args.mysql_user
-    if args.mysql_password:
-        mysql_config['password'] = args.mysql_password
-    if args.mysql_database:
-        mysql_config['database'] = args.mysql_database
-
-    if not mysql_config.get('host') or not mysql_config.get('user') or not mysql_config.get('port'):
-        print("错误: 请通过配置文件或命令行提供完整的 MySQL 连接信息")
-        print("配置示例:")
-        print('  {"insert_mysql": {"host": "localhost", "port": 3306, "user": "root", "password": "xxx", "db": "validation_db"}}')
-        return
+    print(f"输出目录: {output_dir}")
 
     # 检查 old-csv 文件是否存在，如果不存在则等待5分钟重试，最多48次（240分钟）
     max_retries = 48
@@ -277,9 +331,41 @@ def main():
         diff_val = diff.get('diff_value', 0)
         print(f"{diff['database_name']}.{diff['table_name']} - 行数: {old_val} → {new_val} (差值: {diff_val})")
 
-    # 将差异结果写入数据库（使用英文列名）
-    print("正在将结果写入数据库...")
-    insert_comparison_results(mysql_config, differences, args.data_dt)
+    # 导出到CSV文件
+    print(f"\n正在导出结果到CSV...")
+    output_csv = os.path.join(output_dir, f'{today}/{args.data_dt}_table_comparison.csv')
+    csv_file = export_to_hive_csv(differences, output_csv)
+
+    if csv_file:
+        print(f"CSV文件已生成: {csv_file}")
+
+        # 加载到Hive（可选）
+        if not args.skip_hive:
+            print(f"\n正在加载数据到Hive...")
+
+            # 从配置获取Hive配置
+            hive_config = config.get('hive', {})
+            if args.hive_table:
+                hive_config['table'] = args.hive_table
+
+            # 如果没有Hive配置，使用默认值
+            if not hive_config:
+                hive_config = {
+                    'database': 'default',
+                    'table': 'table_comparison',
+                    'hdfs_path': '/user/hive/warehouse'
+                }
+                print(f"使用默认Hive配置: {hive_config}")
+
+            success = load_to_hive_simple(csv_file, hive_config, args.data_dt)
+            if success:
+                print("数据已成功加载到Hive!")
+            else:
+                print("警告: 加载到Hive失败，但CSV文件已生成")
+        else:
+            print("跳过Hive加载步骤")
+    else:
+        print("警告: CSV文件生成失败")
 
     print("行数对比完成!")
 
