@@ -10,8 +10,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS {{database}}.{{table}} (
     new_value BIGINT,
     diff_value BIGINT,
     data_dt STRING,
-    compare_date STRING,
-    cluster_type STRING
+    compare_date STRING
 )
 PARTITIONED BY (data_dt STRING)
 ROW FORMAT DELIMITED

@@ -171,7 +171,7 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     fieldnames = [
         'database_name', 'table_name', 'partition_name',
         'metric_name', 'old_value', 'new_value', 'diff_value',
-        'data_dt', 'compare_date', 'cluster_type'
+        'data_dt', 'compare_date'
     ]
 
     # 添加额外的字段
@@ -180,7 +180,6 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     for diff in differences:
         enriched_diff = diff.copy()
         enriched_diff['compare_date'] = today  # 对比日期
-        enriched_diff['cluster_type'] = 'table_comparison'  # 集群类型标识
         enriched_differences.append(enriched_diff)
 
     # 写入CSV文件（Hive格式，需要指定NULL值的表示方式）
