@@ -195,42 +195,28 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     return output_file
 
 def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
-    """将CSV文件加载到Hive表（简化版本）"""
+    """将CSV文件加载到Hive表"""
     if not os.path.exists(csv_file):
         print(f"错误: CSV文件不存在 {csv_file}")
         return False
 
     hive_database = hive_config.get('database', 'default')
     hive_table = hive_config.get('table', 'table_comparison')
-    hdfs_base_path = hive_config.get('hdfs_path', '/user/hive/warehouse')
-    hdfs_target_path = f"{hdfs_base_path}/{hive_database}.db/{hive_table}/data_dt={data_dt}"
 
     try:
         print(f"准备将CSV文件加载到Hive...")
         print(f"CSV文件: {csv_file}")
         print(f"Hive表: {hive_database}.{hive_table}")
-        print(f"HDFS路径: {hdfs_target_path}")
 
-        # 1. 添加分区（如果分区不存在）
-        add_partition_sql = f"""
-        ALTER TABLE {hive_database}.{hive_table}
-        ADD IF NOT EXISTS PARTITION (data_dt='{data_dt}')
-        LOCATION '{hdfs_target_path}'
-        """
-
-        # 2. 加载数据到分区（使用LOAD DATA）
+        # 加载数据到分区（LOAD DATA LOCAL INPATH会自动上传本地文件到HDFS并创建分区）
         load_data_sql = f"""
         LOAD DATA LOCAL INPATH '{csv_file}'
         OVERWRITE INTO TABLE {hive_database}.{hive_table}
         PARTITION (data_dt='{data_dt}')
         """
 
-        # 执行Hive命令
-        hive_cmd = f"{add_partition_sql}; {load_data_sql}"
         print(f"执行Hive命令...")
-
-        # 使用hive -e执行SQL
-        cmd = ["hive", "-e", hive_cmd]
+        cmd = ["hive", "-e", load_data_sql]
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
@@ -267,7 +253,7 @@ def main():
 
     # 加载配置
     config = load_env_config()
-    csv_dir = config.get('csv_dir', 'output')
+    csv_dir = config.get('csv_dir')
 
     # 设置输出目录
     output_dir = args.output_dir or csv_dir
@@ -351,8 +337,7 @@ def main():
             if not hive_config:
                 hive_config = {
                     'database': 'default',
-                    'table': 'table_comparison',
-                    'hdfs_path': '/user/hive/warehouse'
+                    'table': 'table_comparison'
                 }
                 print(f"使用默认Hive配置: {hive_config}")
 
