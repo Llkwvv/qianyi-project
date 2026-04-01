@@ -193,7 +193,7 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     # 写入CSV文件（Hive格式，需要指定NULL值的表示方式）
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        # 不写入表头
         for diff in enriched_differences:
             # 将None转换为空字符串，这样Hive可以解析为NULL
             row = {k: ('' if v is None else str(v)) for k, v in diff.items()}
@@ -202,7 +202,7 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     print(f"行数对比结果已导出到CSV: {output_file}")
     return output_file
 
-def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
+def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str, output_dir: str):
     """将CSV文件加载到Hive表"""
     if not os.path.exists(csv_file):
         print(f"错误: CSV文件不存在 {csv_file}")
@@ -210,25 +210,39 @@ def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
 
     hive_database = hive_config.get('database', 'default')
     hive_table = hive_config.get('table', 'table_comparison')
+    beeline_url = hive_config.get('beeline_url', 'jdbc:hive2://localhost:10000')
 
     try:
         print(f"准备将CSV文件加载到Hive...")
         print(f"CSV文件: {csv_file}")
         print(f"Hive表: {hive_database}.{hive_table}")
 
-        # 加载数据到分区（LOAD DATA LOCAL INPATH会自动上传本地文件到HDFS并创建分区）
+        # 使用与output_file相同的路径
+        hdfs_dir = f"{output_dir}/{data_dt}"
+        print(f"正在上传CSV文件到HDFS: {hdfs_dir}")
+        hdfs_put_cmd = ["hdfs", "dfs", "-put", "-f", csv_file, hdfs_dir + "/"]
+        print(f"执行命令: {' '.join(hdfs_put_cmd)}")
+        result = subprocess.run(hdfs_put_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            print(f"上传到HDFS失败")
+            return False
+        print(f"CSV文件已成功上传到HDFS")
+
+        # 使用HDFS路径加载数据到分区
+        hdfs_file_path = f"{hdfs_dir}/{os.path.basename(csv_file)}"
         load_data_sql = f"""
-        LOAD DATA LOCAL INPATH '{csv_file}'
+        LOAD DATA INPATH '{hdfs_file_path}'
         OVERWRITE INTO TABLE {hive_database}.{hive_table}
         PARTITION (data_dt='{data_dt}')
         """
 
-        print(f"执行Hive命令...")
-        cmd = ["hive", "-e", load_data_sql]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print(f"执行Beeline命令...")
+        cmd = ["beeline", "-u", beeline_url, "-e", load_data_sql]
+        print(f"执行命令: {' '.join(cmd)}")
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         if result.returncode != 0:
-            print(f"Hive命令执行失败: {result.stderr}")
+            print(f"Hive命令执行失败")
             return False
 
         print(f"数据已成功加载到Hive表: {hive_database}.{hive_table}")
@@ -236,11 +250,12 @@ def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str):
 
         # 验证数据加载
         count_sql = f"SELECT COUNT(*) FROM {hive_database}.{hive_table} WHERE data_dt='{data_dt}'"
-        count_cmd = ["hive", "-e", count_sql]
-        count_result = subprocess.run(count_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        count_cmd = ["beeline", "-u", beeline_url, "-e", count_sql]
+        print(f"执行命令: {' '.join(count_cmd)}")
+        count_result = subprocess.run(count_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         if count_result.returncode == 0:
-            print(f"加载到Hive的数据行数: {count_result.stdout.strip()}")
+            print(f"加载到Hive的数据行数: {count_result.stdout.decode().strip()}")
 
         return True
 
@@ -362,7 +377,7 @@ def main():
                 }
                 print(f"使用默认Hive配置: {hive_config}")
 
-            success = load_to_hive_simple(csv_file, hive_config, args.data_dt)
+            success = load_to_hive_simple(csv_file, hive_config, args.data_dt, output_dir)
             if success:
                 print("数据已成功加载到Hive!")
             else:

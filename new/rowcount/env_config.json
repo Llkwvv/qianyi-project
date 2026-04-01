@@ -6,12 +6,10 @@
     "password": "000000",
     "db": "metastore"
   },
-  "insert_mysql": {
-    "host": "172.20.10.6",
-    "port": 3306,
-    "user": "root",
-    "password": "000000",
-    "db": "validation_db"
+  "hive": {
+    "database": "default",
+    "table": "table_comparison",
+    "beeline_url": "jdbc:hive2://localhost:10000"
   },
   "csv_dir": "/home/lkw/qianyi-project/new/input"
 }
