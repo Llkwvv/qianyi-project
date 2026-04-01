@@ -269,19 +269,32 @@ def main():
     print(f"新集群CSV: {args.new_csv}")
     print(f"输出目录: {output_dir}")
 
-    # 检查 old-csv 文件是否存在，如果不存在则等待5分钟重试，最多48次（240分钟）
+    # 检查 old-csv 和 new-csv 文件是否存在，如果不存在则等待5分钟重试，最多48次（240分钟）
     max_retries = 48
     retry_interval = 300  # 5 minutes in seconds
 
     for attempt in range(max_retries):
-        if os.path.exists(args.old_csv):
+        old_exists = os.path.exists(args.old_csv)
+        new_exists = os.path.exists(args.new_csv)
+        if old_exists and new_exists:
             break
         else:
             if attempt < max_retries - 1:
+                missing = []
+                if not old_exists:
+                    missing.append(f"旧集群CSV: {args.old_csv}")
+                if not new_exists:
+                    missing.append(f"新集群CSV: {args.new_csv}")
                 print(f"等待 {retry_interval//60} 分钟，第 {attempt+1}/{max_retries} 次尝试...")
+                print(f"缺失文件: {', '.join(missing)}")
                 time.sleep(retry_interval)
             else:
-                print(f"错误: {args.old_csv} 文件在 {max_retries*retry_interval//60} 分钟内仍未出现")
+                missing = []
+                if not old_exists:
+                    missing.append(args.old_csv)
+                if not new_exists:
+                    missing.append(args.new_csv)
+                print(f"错误: 以下文件在 {max_retries*retry_interval//60} 分钟内仍未出现: {missing}")
                 return
 
     # 读取数据
