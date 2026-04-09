@@ -8,8 +8,8 @@
   },
   "hive": {
     "database": "default",
-    "table": "table_comparison",
-    "beeline_url": "jdbc:hive2://localhost:10000"
-  },
+    "table": "table_comparison", 
+    "beeline_url": "jdbc:hive2://172.20.10.6:10000/default"
+    },
   "csv_dir": "/home/lkw/qianyi-project/new/input"
 }

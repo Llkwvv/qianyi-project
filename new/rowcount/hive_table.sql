@@ -1,7 +1,7 @@
 -- 表行数对比结果表
 -- 用于存储新旧集群表行数对比数据
 
-CREATE EXTERNAL TABLE IF NOT EXISTS {{database}}.{{table}} (
+CREATE TABLE IF NOT EXISTS {{database}}.{{table}} (
     database_name STRING,
     table_name STRING,
     partition_name STRING,

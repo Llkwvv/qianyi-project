@@ -1,0 +1,17 @@
+database_name,table_name,table_type,partition_name,num_files,total_size,raw_data_size,num_rows,last_access_time,data_dt
+default,student,MANAGED_TABLE,,0,0,0,0,0,20221111
+gmall,dim_date,MANAGED_TABLE,,731,4783,1,511525,0,20221111
+gmall,tmp_dim_date_info,EXTERNAL_TABLE,,,,,,0,20221111
+gmall,ads_page_path,MANAGED_TABLE,,216,9861,31,9645,0,20221111
+gmall,dwd_user_action_path_mid,MANAGED_TABLE,,,424095,194,,0,20221111
+gmall,dwd_trade_flow_inc,MANAGED_TABLE,,,2190504,116,,0,20221111
+gmall,dwd_trade_display_inc,MANAGED_TABLE,,,1824065,116,,0,20221111
+gmall,dwd_trade_action_inc,MANAGED_TABLE,,,118807,110,,0,20221111
+gmall,dwd_trade_pv_inc,MANAGED_TABLE,,,247632,116,,0,20221111
+validation_db,metrics_summary,MANAGED_TABLE,,4,346,1,342,0,20221111
+validation_db,test_table,MANAGED_TABLE,,0,0,0,0,0,20221111
+gmall,ods_log_inc,EXTERNAL_TABLE,dt,0,481863414,2712,0,0,20221111
+gmall,dwd_traffic_page_view_inc,MANAGED_TABLE,dt,2523652488,12792446096,49,2621971595662,0,20221111
+gmall,dim_sku_full,MANAGED_TABLE,dt,35,10697,1,122424,0,20221111
+gmall,dim_province_full,MANAGED_TABLE,dt,34,1809,1,21012,0,20221111
+gmall,dwd_traffic_action_inc,MANAGED_TABLE,dt,11367804,64109153,1,12390906864,0,20221111

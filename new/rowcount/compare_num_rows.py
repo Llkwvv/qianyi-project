@@ -218,7 +218,7 @@ def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str, output_d
         print(f"Hive表: {hive_database}.{hive_table}")
 
         # 使用与output_file相同的路径
-        hdfs_dir = f"{output_dir}/{data_dt}"
+        hdfs_dir = f"{output_dir}{data_dt}"
         print(f"正在上传CSV文件到HDFS: {hdfs_dir}")
         hdfs_put_cmd = ["hdfs", "dfs", "-put", "-f", csv_file, hdfs_dir + "/"]
         print(f"执行命令: {' '.join(hdfs_put_cmd)}")
