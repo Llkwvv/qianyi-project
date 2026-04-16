@@ -9,12 +9,9 @@ CREATE TABLE IF NOT EXISTS {{database}}.{{table}} (
     old_value BIGINT,
     new_value BIGINT,
     diff_value BIGINT,
-    data_dt STRING,
-    compare_date STRING
+    etl_tm STRING
 )
 PARTITIONED BY (data_dt STRING)
 ROW FORMAT DELIMITED
 FIELDS TERMINATED BY ','
 STORED AS TEXTFILE
-LOCATION '{{hdfs_base_path}}/{{database}}.db/{{table}}'
-TBLPROPERTIES ('skip.header.line.count'='1');

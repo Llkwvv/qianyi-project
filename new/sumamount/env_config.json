@@ -1,0 +1,33 @@
+{
+  "artifact_dir": "output",
+  "runtime": {
+    "max_workers": 4,
+    "max_retries": 0,
+    "query_timeout_sec": 1800,
+    "poll_interval_sec": 300,
+    "wait_timeout_sec": 14400
+  },
+  "clusters": {
+    "old": {
+      "beeline_url": "jdbc:hive2://localhost:10000/default",
+      "username": "atguigu",
+      "use_ssh": true,
+      "ssh_host": "172.20.10.6",
+      "ssh_port": 22,
+      "ssh_user": "atguigu"
+    },
+    "new": {
+      "beeline_url": "jdbc:hive2://localhost:10000/default",
+      "username": "atguigu",
+      "use_ssh": false
+    }
+  },
+  "metastore_mysql": {
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore"
+  },
+  "csv_dir": "output"
+}

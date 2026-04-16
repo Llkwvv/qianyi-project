@@ -1,0 +1,41 @@
+{
+  "artifact_dir": "output",
+  "runtime": {
+    "max_workers": 4,
+    "max_retries": 0,
+    "query_timeout_sec": 1800,
+    "poll_interval_sec": 300,
+    "wait_timeout_sec": 14400
+  },
+  "clusters": {
+    "old": {
+      "beeline_cmd": "/home/lkw/apache-hive-3.1.3-bin/bin/beeline",
+      "beeline_url": "jdbc:hive2://192.168.10.102:10000/",
+      "username": "atguigu",
+      "use_ssh": false
+    },
+    "new": {
+      "beeline_cmd": "/home/lkw/apache-hive-3.1.3-bin/bin/beeline",
+      "beeline_url": "jdbc:hive2://192.168.10.102:10000/",
+      "username": "atguigu",
+      "use_ssh": false
+    }
+  },
+  "hive": {
+    "database": "default",
+    "table": "metric_comparison",
+    "beeline_cmd": "/home/lkw/apache-hive-3.1.3-bin/bin/beeline",
+    "beeline_url": "jdbc:hive2://192.168.10.102:10000/",
+    "username": "atguigu",
+    "use_ssh": false,
+    "hdfs_dir": "/tmp/sumamount_metric_comparison"
+  },
+  "metastore_mysql": {
+    "host": "172.20.10.6",
+    "port": 3306,
+    "user": "root",
+    "password": "000000",
+    "db": "metastore"
+  },
+  "csv_dir": "output"
+}

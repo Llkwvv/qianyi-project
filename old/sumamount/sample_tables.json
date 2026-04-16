@@ -1,0 +1,13 @@
+{
+  "tables": [
+    {
+      "name": "gmall.dim_activity_full",
+      "partition_cols": ["dt"],
+      "fields": [
+        {"name": "condition_amount", "type": "decimal(16,2)"},
+        {"name": "benefit_amount", "type": "decimal(16,2)"},
+        {"name": "benefit_discount", "type": "decimal(16,2)"}
+      ]
+    }
+  ]
+}
