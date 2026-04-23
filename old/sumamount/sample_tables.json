@@ -8,6 +8,29 @@
         {"name": "benefit_amount", "type": "decimal(16,2)"},
         {"name": "benefit_discount", "type": "decimal(16,2)"}
       ]
+    },
+    {
+      "name": "gmall.dim_sku_full",
+      "partition_cols": ["dt"],
+      "fields": [
+        {"name": "price", "type": "decimal(16,2)"},
+        {"name": "weight", "type": "decimal(16,2)"}
+      ]
+    },
+    {
+      "name": "gmall.dim_province_full",
+      "partition_cols": ["dt"],
+      "fields": []
+    },
+    {
+      "name": "gmall.ods_base_category1_full",
+      "partition_cols": ["dt"],
+      "fields": []
+    },
+    {
+      "name": "gmall.ods_base_dic_full",
+      "partition_cols": ["dt"],
+      "fields": []
     }
   ]
 }

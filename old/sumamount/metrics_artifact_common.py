@@ -10,7 +10,163 @@ import re
 import shlex
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+
+# 尝试导入 pyhive，如果失败则使用 beeline 模式
+try:
+    from pyhive import hive
+    HIVE_DRIVER_AVAILABLE = True
+except ImportError:
+    HIVE_DRIVER_AVAILABLE = False
+
+
+class HiveConnectionPool:
+    """Hive 连接池，支持连接复用和 Tez 引擎"""
+
+    _conn_counter = 0  # 连接计数器，用于生成唯一ID
+
+    def __init__(self, host, port, username, database='default',
+                 max_connections=5, use_tez=True):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.database = database
+        self.max_connections = max_connections
+        self.use_tez = use_tez
+        self.pool = []
+        self.lock = threading.Lock()
+        self._init_pool()
+
+    def _init_pool(self):
+        """预创建指定数量的连接"""
+        for _ in range(self.max_connections):
+            conn = self._create_connection()
+            self.pool.append(conn)
+
+    def _create_connection(self):
+        """创建一个新的 Hive 连接"""
+        import socket
+        HiveConnectionPool._conn_counter += 1
+        conn_id = HiveConnectionPool._conn_counter
+
+        print('[连接池] 正在创建连接 #{0} (host={1}:{2})...'.format(
+            conn_id, self.host, self.port))
+
+        conn = hive.Connection(
+            host=self.host,
+            port=self.port,
+            username=self.username,
+            database=self.database,
+            auth='NONE'
+        )
+
+        # 设置执行引擎
+        cursor = conn.cursor()
+        if self.use_tez:
+            cursor.execute("SET hive.execution.engine=tez")
+        else:
+            cursor.execute("SET hive.execution.engine=mr")
+        cursor.close()
+        conn._conn_id = conn_id
+        print('[连接池] 创建新连接 #{0} 成功'.format(conn_id))
+        return conn
+
+    def get_connection(self):
+        """从连接池获取一个连接"""
+        import threading
+        task_name = threading.current_thread().name
+        with self.lock:
+            if self.pool:
+                conn = self.pool.pop()
+                # 检查连接是否仍然有效
+                try:
+                    conn.ping()
+                except Exception:
+                    # 连接失效，重新创建
+                    conn = self._create_connection()
+                print('[连接池] 任务 {0} 复用连接 #{1} (池中剩余: {2}, 总连接数: {3})'.format(
+                    task_name, conn._conn_id, len(self.pool), self.max_connections))
+                return conn
+            else:
+                # 池已空，创建新连接
+                conn = self._create_connection()
+                print('[连接池] 任务 {0} 使用新连接 #{1} (池为空, 总连接数: {2})'.format(
+                    task_name, conn._conn_id, self.max_connections))
+                return conn
+
+    def return_connection(self, conn):
+        """归还连接到池中"""
+        import threading
+        task_name = threading.current_thread().name
+        with self.lock:
+            if len(self.pool) < self.max_connections:
+                self.pool.append(conn)
+                print('[连接池] 任务 {0} 归还连接 #{1} (池中现有: {2})'.format(
+                    task_name, conn._conn_id, len(self.pool)))
+            else:
+                conn.close()
+                print('[连接池] 任务 {0} 关闭连接 #{1}'.format(
+                    task_name, conn._conn_id))
+
+    def close_all(self):
+        """关闭所有连接"""
+        with self.lock:
+            for conn in self.pool:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self.pool.clear()
+
+
+# 全局连接池实例
+_global_pool = None
+_pool_lock = threading.Lock()
+
+
+def get_hive_connection_pool(cluster_config, max_connections=4, use_tez=True):
+    """获取或创建全局 Hive 连接池"""
+    global _global_pool
+
+    # 解析 beeline_url 获取 host 和 port
+    beeline_url = cluster_config.get('beeline_url', '')
+    # jdbc:hive2://192.168.10.102:10000/
+    host = cluster_config.get('hive_host') or 'hadoop102'
+    port = cluster_config.get('hive_port') or 10000
+
+    # 从 URL 中解析 host 和 port
+    if 'hive2://' in beeline_url:
+        parts = beeline_url.split('hive2://')[1].split('/')[0].split(':')
+        if len(parts) >= 1:
+            host = parts[0]
+        if len(parts) >= 2:
+            port = int(parts[1])
+
+    username = cluster_config.get('username', 'atguigu')
+    database = cluster_config.get('database', 'default')
+
+    with _pool_lock:
+        if _global_pool is None:
+            _global_pool = HiveConnectionPool(
+                host=host,
+                port=port,
+                username=username,
+                database=database,
+                max_connections=max_connections,
+                use_tez=use_tez
+            )
+    return _global_pool
+
+
+def close_hive_connection_pool():
+    """关闭全局连接池"""
+    global _global_pool
+    with _pool_lock:
+        if _global_pool:
+            _global_pool.close_all()
+            _global_pool = None
 
 
 ARTIFACT_FIELDNAMES = [
@@ -142,14 +298,21 @@ def build_beeline_command(cluster_config, sql):
     if not beeline_url:
         raise ValueError('集群配置缺少 beeline_url')
 
+    use_tez = cluster_config.get('use_tez', True)
+
     base_cmd = [
         beeline_cmd,
         '-u', beeline_url,
         '--outputformat=tsv',
         '--showHeader=true',
         '--silent=true',
-        '-e', sql,
     ]
+
+    # 如果不使用tez，先设置mr引擎
+    if not use_tez:
+        base_cmd.extend(['-e', 'set hive.execution.engine=mr;'])
+
+    base_cmd.extend(['-e', sql])
 
     username = cluster_config.get('username')
     if username:
@@ -187,26 +350,43 @@ def parse_beeline_tsv(stdout_text):
 
     for raw_line in stdout_text.splitlines():
         line = raw_line.strip()
-        if not line or '\t' not in line:
+        if not line:
             continue
         if line.startswith('WARN') or line.startswith('INFO') or line.startswith('SLF4J'):
             continue
-        normalized_line = BEELINE_PROMPT_PREFIX_RE.sub('', raw_line, count=1)
-        tsv_lines.append(normalized_line)
+        # Skip lines that look like table borders
+        if line.startswith('+') or line.startswith('|'):
+            continue
+        normalized_line = BEELINE_PROMPT_PREFIX_RE.sub('', raw_line, count=1).strip()
+        if normalized_line:
+            tsv_lines.append(normalized_line)
 
     if not tsv_lines:
         raise ValueError('未能从 beeline 输出中解析到 TSV 数据')
 
     parsed_lines = []
     for line in tsv_lines:
-        row = next(csv.reader([line], delimiter='\t'))
-        parsed_lines.append([normalize_beeline_field(value) for value in row])
+        if '\t' in line:
+            # Tab-separated format (multi-column)
+            row = next(csv.reader([line], delimiter='\t'))
+            parsed_lines.append([normalize_beeline_field(value) for value in row])
+        else:
+            # Single column format (no tabs)
+            parsed_lines.append([normalize_beeline_field(line)])
+
+    # Handle case where only data rows exist (no header)
+    if len(parsed_lines) == 1:
+        # Single row, treat as data with single column name
+        return ['col1'], [parsed_lines[0]]
 
     header = parsed_lines[0]
     data_rows = []
     for row in parsed_lines[1:]:
         if len(row) == len(header):
             data_rows.append(row)
+        elif len(row) == 1 and len(header) > 1:
+            # Single value, pad to match header length
+            data_rows.append(row * len(header))
 
     return header, data_rows
 
@@ -220,7 +400,96 @@ def normalize_beeline_field(value):
 
 
 def execute_hive_sql(cluster_name, cluster_config, sql, timeout_sec):
-    """Execute one Hive SQL and return exactly one row as a dict."""
+    """Execute one Hive SQL and return exactly one row as a dict.
+
+    仅使用 Tez 连接池模式，不支持回退。
+    """
+    if not HIVE_DRIVER_AVAILABLE:
+        raise RuntimeError('pyhive 未安装，无法使用 Tez 连接池模式')
+
+    return _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec)
+
+
+def _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec):
+    """使用连接池执行 Hive SQL（带超时）"""
+    import threading
+    import socket
+    # 从配置中获取最大并发数
+    max_workers = cluster_config.get('max_workers', 4)
+    use_tez = cluster_config.get('use_tez', True)
+
+    # 获取或创建连接池
+    pool = get_hive_connection_pool(cluster_config, max_workers, use_tez)
+
+    # 从连接池获取连接
+    conn = pool.get_connection()
+    conn_id = conn._conn_id
+
+    # 设置 socket 超时（如果连接有 socket 属性）
+    socket_attr = getattr(conn, '_socket', None)
+    if socket_attr is not None:
+        socket_attr.settimeout(timeout_sec)
+
+    cursor = conn.cursor()
+
+    task_name = threading.current_thread().name
+    # 截取SQL前100个字符作为显示
+    sql_preview = sql.strip()[:100].replace('\n', ' ')
+    print('[任务 {0}] 开始执行 (连接 #{1}, Tez引擎: {2}, 超时: {3}秒): {4}...'.format(
+        task_name, conn_id, use_tez, timeout_sec, sql_preview))
+
+    try:
+        # 设置执行引擎为 Tez（如果需要）
+        if use_tez:
+            cursor.execute("SET hive.execution.engine=tez")
+
+        # 打印将要执行的 SQL
+        print('[任务 {0}] 提交 SQL 到 Hive...'.format(task_name))
+
+        # 执行 SQL（带超时）
+        cursor.execute(sql)
+
+        # 获取执行状态
+        print('[任务 {0}] SQL 执行完成，正在获取结果...'.format(task_name))
+
+        # 获取结果
+        if cursor.description:
+            # 有返回结果的查询
+            result = cursor.fetchall()
+            if len(result) != 1:
+                raise ValueError(
+                    '集群 {0} 的 SQL 结果必须是 1 行，实际为 {1} 行'.format(
+                        cluster_name, len(result)
+                    )
+                )
+            # 获取列名
+            columns = [desc[0] for desc in cursor.description]
+            print('[任务 {0}] 成功获取结果: {1}'.format(task_name, dict(zip(columns, result[0]))))
+            return dict(zip(columns, result[0]))
+        else:
+            # DDL/DML 语句
+            raise ValueError(
+                '集群 {0} 的 SQL 查询没有返回结果'.format(cluster_name)
+            )
+
+    except socket.timeout:
+        print('[任务 {0}] 执行超时 ({1}秒)'.format(task_name, timeout_sec))
+        raise RuntimeError(
+            '集群 {0} 执行超时 (超过 {1} 秒)'.format(cluster_name, timeout_sec)
+        )
+    except Exception as e:
+        print('[任务 {0}] 执行失败: {1}'.format(task_name, str(e)))
+        raise RuntimeError(
+            '集群 {0} 执行失败: {1}'.format(cluster_name, str(e))
+        )
+    finally:
+        cursor.close()
+        pool.return_connection(conn)
+        print('[任务 {0}] 连接已归还池 (连接 #{1})'.format(task_name, conn_id))
+
+
+def _execute_hive_sql_with_beeline(cluster_name, cluster_config, sql, timeout_sec):
+    """使用 beeline 命令执行 Hive SQL（回退模式）"""
     cmd = build_beeline_command(cluster_config, sql)
     result = subprocess.run(
         cmd,

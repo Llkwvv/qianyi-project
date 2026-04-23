@@ -171,26 +171,44 @@ def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
 
     ensure_hive_table(hive_config)
 
-    hdfs_target_dir = build_hdfs_target_dir(hive_config['hdfs_dir'], data_dt)
-    hdfs_file_path = '{0}/{1}'.format(hdfs_target_dir, os.path.basename(csv_file))
+    # Read CSV and insert data using INSERT OVERWRITE
+    import csv as csv_module
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        reader = csv_module.reader(f)
+        rows = list(reader)
 
-    run_hdfs_command(['hdfs', 'dfs', '-mkdir', '-p', hdfs_target_dir])
-    run_hdfs_command(['hdfs', 'dfs', '-put', '-f', csv_file, hdfs_target_dir + '/'])
+    if not rows:
+        raise ValueError('CSV 文件为空: {0}'.format(csv_file))
 
-    load_sql = """
-LOAD DATA INPATH '{hdfs_file_path}'
-OVERWRITE INTO TABLE {database_name}.{table_name}
-PARTITION (data_dt='{data_dt}')
+    # Build INSERT statement
+    db_name = hive_config['database']
+    tbl_name = hive_config['table']
+
+    # Escape single quotes and handle empty values
+    values_list = []
+    for row in rows:
+        values = []
+        for val in row:
+            if val == '' or val is None:
+                values.append('NULL')
+            else:
+                values.append("'{}'".format(val.replace("'", "\\'").replace("\\", "\\\\")))
+        values_list.append('({})'.format(', '.join(values)))
+
+    insert_sql = """
+INSERT OVERWRITE TABLE {db}.{tbl} PARTITION (data_dt='{data_dt}')
+VALUES {values}
 """.format(
-        hdfs_file_path=hdfs_file_path,
-        database_name=hive_config['database'],
-        table_name=hive_config['table'],
+        db=db_name,
+        tbl=tbl_name,
         data_dt=data_dt,
+        values=', '.join(values_list)
     )
-    load_result = run_beeline_sql(hive_config, load_sql)
-    if load_result.returncode != 0:
-        stderr = load_result.stderr.decode('utf-8', errors='replace').strip()
-        raise RuntimeError('加载 Hive 表失败: {0}'.format(stderr or '无错误输出'))
+
+    insert_result = run_beeline_sql(hive_config, insert_sql)
+    if insert_result.returncode != 0:
+        stderr = insert_result.stderr.decode('utf-8', errors='replace').strip()
+        raise RuntimeError('插入 Hive 数据失败: {0}'.format(stderr or '无错误输出'))
 
     count_sql = """
 SELECT count(1) as row_count
@@ -221,7 +239,6 @@ def main():
     parser.add_argument('--output-file', help='输出结果 CSV 路径')
     parser.add_argument('--hive-table', help='Hive 表名，格式 database.table 或 table')
     parser.add_argument('--hdfs-dir', help='HDFS 落地目录，默认读配置')
-    parser.add_argument('--skip-hive', action='store_true', help='只生成对比 CSV，不写入 Hive')
     args = parser.parse_args()
 
     config = load_env_config()
@@ -258,18 +275,14 @@ def main():
     print('对比完成: {0}'.format(args.output_file))
     print('共输出 {0} 条结果'.format(len(compare_rows)))
 
-    if args.skip_hive:
-        print('跳过 Hive 加载')
-        return
-
     hive_config = config.get('hive', {}).copy()
     hive_config.setdefault('database', 'default')
     hive_config.setdefault('table', 'metric_comparison')
     hive_config.setdefault('beeline_cmd', '/home/lkw/apache-hive-3.1.3-bin/bin/beeline')
-    hive_config.setdefault('beeline_url', 'jdbc:hive2://192.168.10.102:10000/')
+    hive_config.setdefault('beeline_url', 'jdbc:hive2://172.20.10.6:10000/')
     hive_config.setdefault('username', 'atguigu')
     hive_config.setdefault('use_ssh', False)
-    hive_config.setdefault('hdfs_dir', '/tmp/sumamount_metric_comparison')
+    hive_config.setdefault('hdfs_dir', '/home/lkw/qianyi-project/old/sumamount/hdfs_tmp')
 
     if args.hive_table:
         if '.' in args.hive_table:
