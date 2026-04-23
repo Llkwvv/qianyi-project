@@ -1,5 +1,5 @@
 {
-  "artifact_dir": "output",
+  "artifact_dir": "/home/lkw/qianyi-project/output",
   "runtime": {
     "max_workers": 4,
     "max_retries": 0,
@@ -39,5 +39,5 @@
     "password": "000000",
     "db": "metastore"
   },
-  "csv_dir": "output"
+  "csv_dir": "/home/lkw/qianyi-project/output"
 }

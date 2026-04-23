@@ -44,8 +44,8 @@ def generate_sql_for_table(table: dict) -> str:
     # 添加 etl_tm 时间戳列
     select_cols.append("current_timestamp() as etl_tm")
 
-    # row_count 指标
-    select_cols.append("count(1) as row_count")
+    # row_counts 指标
+    select_cols.append("count(1) as row_counts")
 
     # decimal 字段的 sum 聚合
     for field in fields:
