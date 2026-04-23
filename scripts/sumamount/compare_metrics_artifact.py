@@ -165,58 +165,76 @@ def run_hdfs_command(cmd):
 
 
 def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
-    """Upload the comparison CSV to HDFS and load it into the Hive table."""
+    """通过INSERT方式将对比CSV写入Hive表"""
     if not os.path.exists(csv_file):
         raise ValueError('对比结果文件不存在: {0}'.format(csv_file))
 
     ensure_hive_table(hive_config)
 
-    # Read CSV and insert data using INSERT OVERWRITE
-    import csv as csv_module
+    hive_database = hive_config['database']
+    hive_table = hive_config['table']
+
+    # 读取CSV文件
+    print('读取CSV文件: {0}'.format(csv_file))
     with open(csv_file, 'r', encoding='utf-8') as f:
-        reader = csv_module.reader(f)
+        reader = csv.DictReader(f)
         rows = list(reader)
 
     if not rows:
-        raise ValueError('CSV 文件为空: {0}'.format(csv_file))
+        print('CSV文件没有数据')
+        return 0
 
-    # Build INSERT statement
-    db_name = hive_config['database']
-    tbl_name = hive_config['table']
+    print('共 {0} 条数据需要写入Hive'.format(len(rows)))
 
-    # Escape single quotes and handle empty values
-    values_list = []
-    for row in rows:
-        values = []
-        for val in row:
-            if val == '' or val is None:
-                values.append('NULL')
-            else:
-                values.append("'{}'".format(val.replace("'", "\\'").replace("\\", "\\\\")))
-        values_list.append('({})'.format(', '.join(values)))
+    # 批量插入数据
+    batch_size = 100
+    total_rows = len(rows)
 
-    insert_sql = """
-INSERT OVERWRITE TABLE {db}.{tbl} PARTITION (data_dt='{data_dt}')
-VALUES {values}
-""".format(
-        db=db_name,
-        tbl=tbl_name,
-        data_dt=data_dt,
-        values=', '.join(values_list)
-    )
+    for i in range(0, total_rows, batch_size):
+        batch = rows[i:i+batch_size]
+        values_list = []
 
-    insert_result = run_beeline_sql(hive_config, insert_sql)
-    if insert_result.returncode != 0:
-        stderr = insert_result.stderr.decode('utf-8', errors='replace').strip()
-        raise RuntimeError('插入 Hive 数据失败: {0}'.format(stderr or '无错误输出'))
+        for row in batch:
+            # 处理NULL值
+            def to_value(val):
+                if val is None or val == '':
+                    return 'NULL'
+                return "'{0}'".format(val.replace("'", "''"))
 
+            value = "({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7})".format(
+                to_value(row.get('database_name')),
+                to_value(row.get('table_name')),
+                to_value(row.get('partition_name')),
+                to_value(row.get('metric_name')),
+                to_value(row.get('old_value')),
+                to_value(row.get('new_value')),
+                to_value(row.get('diff_value')),
+                to_value(data_dt)
+            )
+            values_list.append(value)
+
+        insert_sql = "INSERT INTO TABLE {0}.{1} VALUES {2}".format(
+            hive_database,
+            hive_table,
+            ','.join(values_list)
+        )
+
+        print('正在写入第 {0} 批数据 ({1} 条)...'.format(i//batch_size + 1, len(batch)))
+        load_result = run_beeline_sql(hive_config, insert_sql)
+        if load_result.returncode != 0:
+            stderr = load_result.stderr.decode('utf-8', errors='replace').strip()
+            raise RuntimeError('INSERT 失败: {0}'.format(stderr or '无错误输出'))
+
+    print('数据已写入 Hive')
+
+    # Verify
     count_sql = """
 SELECT count(1) as row_count
 FROM {database_name}.{table_name}
 WHERE data_dt = '{data_dt}'
 """.format(
-        database_name=hive_config['database'],
-        table_name=hive_config['table'],
+        database_name=hive_database,
+        table_name=hive_table,
         data_dt=data_dt,
     )
     count_result = run_beeline_sql(hive_config, count_sql)

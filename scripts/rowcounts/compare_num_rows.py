@@ -202,6 +202,90 @@ def export_to_hive_csv(differences: List[Dict], output_file: str):
     print(f"行数对比结果已导出到CSV: {output_file}")
     return output_file
 
+def load_to_hive_insert(differences: List[Dict], hive_config: dict, data_dt: str):
+    """将CSV数据通过INSERT方式写入Hive表"""
+    if not differences:
+        print("没有数据需要写入Hive")
+        return True
+
+    hive_database = hive_config.get('database', 'default')
+    hive_table = hive_config.get('table', 'table_comparison')
+    beeline_url = hive_config.get('beeline_url', 'jdbc:hive2://localhost:10000')
+    beeline_cmd = hive_config.get('beeline_cmd', 'beeline')
+    username = hive_config.get('username')
+
+    try:
+        print(f"准备通过INSERT方式写入Hive...")
+        print(f"Hive表: {hive_database}.{hive_table}")
+
+        # 批量插入数据
+        batch_size = 100
+        total_rows = len(differences)
+
+        for i in range(0, total_rows, batch_size):
+            batch = differences[i:i+batch_size]
+            values_list = []
+
+            for diff in batch:
+                # 处理NULL值
+                old_val = 'NULL' if diff.get('old_value') is None else diff.get('old_value')
+                new_val = 'NULL' if diff.get('new_value') is None else diff.get('new_value')
+                diff_val = diff.get('diff_value', 0)
+
+                # 处理partition_name
+                partition_name = "''" if not diff.get('partition_name') else "'{0}'".format(diff.get('partition_name'))
+
+                value = "('{0}', '{1}', {2}, '{3}', {4}, {5}, {6}, '{7}')".format(
+                    diff.get('database_name'),
+                    diff.get('table_name'),
+                    partition_name,
+                    diff.get('metric_name'),
+                    old_val,
+                    new_val,
+                    diff_val,
+                    data_dt
+                )
+                values_list.append(value)
+
+            insert_sql = "INSERT INTO TABLE {0}.{1} VALUES {2}".format(
+                hive_database,
+                hive_table,
+                ','.join(values_list)
+            )
+
+            print(f"正在写入第 {i//batch_size + 1} 批数据 ({len(batch)} 条)...")
+            cmd = [beeline_cmd, "-u", beeline_url]
+            if username:
+                cmd.extend(["-n", username])
+            cmd.extend(["-e", insert_sql])
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if result.returncode != 0:
+                print(f"Hive命令执行失败")
+                print(result.stderr.decode())
+                return False
+
+        print(f"数据已成功写入Hive表: {hive_database}.{hive_table}")
+
+        # 验证数据加载
+        count_sql = f"SELECT COUNT(*) FROM {hive_database}.{hive_table} WHERE data_dt='{data_dt}'"
+        count_cmd = [beeline_cmd, "-u", beeline_url]
+        if username:
+            count_cmd.extend(["-n", username])
+        count_cmd.extend(["-e", count_sql])
+        count_result = subprocess.run(count_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        if count_result.returncode == 0:
+            output = count_result.stdout.decode().strip()
+            print(f"写入Hive的数据行数: {output}")
+
+        return True
+
+    except Exception as e:
+        print(f"写入Hive时出错: {e}")
+        return False
+
+
 def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str, output_dir: str):
     """将CSV文件加载到Hive表"""
     if not os.path.exists(csv_file):
@@ -377,7 +461,7 @@ def main():
                 }
                 print(f"使用默认Hive配置: {hive_config}")
 
-            success = load_to_hive_simple(csv_file, hive_config, args.data_dt, output_dir)
+            success = load_to_hive_insert(differences, hive_config, args.data_dt)
             if success:
                 print("数据已成功加载到Hive!")
             else:
