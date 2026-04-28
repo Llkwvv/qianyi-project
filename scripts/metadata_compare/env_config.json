@@ -13,5 +13,5 @@
     "username": "atguigu",
     "beeline_cmd": "/home/lkw/apache-hive-3.1.3-bin/bin/beeline"
   },
-  "csv_dir": "/home/lkw/qianyi-project/output"
+  "file_dir": "/data/transfer_agent/data/upload"
 }

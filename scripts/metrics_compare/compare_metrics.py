@@ -211,20 +211,39 @@ def load_env_config(config_path='env_config.json'):
         return json.load(f)
 
 
-def get_artifact_dir(config):
-    """Return the base directory used for artifacts."""
-    return config.get('artifact_dir') or config.get('csv_dir') or 'output'
+def get_file_dir(config):
+    """Return the base directory used for output files."""
+    return config.get('file_dir') or 'output'
 
 
 def get_runtime_config(config):
     """Return runtime settings with safe defaults."""
     runtime = config.get('runtime', {}).copy()
-    runtime.setdefault('max_workers', 4)
+    runtime.setdefault('max_connections', 4)
     runtime.setdefault('max_retries', 0)
     runtime.setdefault('query_timeout_sec', 1800)
     runtime.setdefault('poll_interval_sec', 300)
     runtime.setdefault('wait_timeout_sec', 14400)
     return runtime
+
+
+def normalize_run_dt(value):
+    """Normalize CLI date input to yyyymmdd."""
+    stripped = (value or '').strip()
+    if re.fullmatch(r'\d{8}', stripped):
+        return stripped
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', stripped):
+        return stripped.replace('-', '')
+    raise ValueError(
+        '--data-dt 格式错误: {0}，期望 yyyymmdd 或 yyyy-mm-dd'.format(value)
+    )
+
+
+def to_partition_dt(run_dt):
+    """Convert yyyymmdd to yyyy-mm-dd for Hive partition filters."""
+    if not re.fullmatch(r'\d{8}', run_dt):
+        raise ValueError('run_dt 格式错误: {0}，期望 yyyymmdd'.format(run_dt))
+    return '{0}-{1}-{2}'.format(run_dt[0:4], run_dt[4:6], run_dt[6:8])
 
 
 def build_default_artifact_path(base_dir, data_dt, cluster_name):
@@ -698,15 +717,19 @@ def main():
 
     config = load_env_config()
     runtime = get_runtime_config(config)
-    artifact_dir = get_artifact_dir(config)
+    artifact_dir = get_file_dir(config)
+    run_dt = normalize_run_dt(args.data_dt)
+    partition_dt = to_partition_dt(run_dt)
 
     if not args.old_artifact:
-        args.old_artifact = build_default_artifact_path(artifact_dir, args.data_dt, 'old')
+        args.old_artifact = build_default_artifact_path(artifact_dir, run_dt, 'old')
     if not args.new_artifact:
-        args.new_artifact = build_default_artifact_path(artifact_dir, args.data_dt, 'new')
+        args.new_artifact = build_default_artifact_path(artifact_dir, run_dt, 'new')
     if not args.output_file:
-        args.output_file = build_default_compare_path(artifact_dir, args.data_dt)
+        args.output_file = build_default_compare_path(artifact_dir, run_dt)
 
+    print('运行日期: {0}'.format(run_dt))
+    print('分区日期: {0}'.format(partition_dt))
     print('old 文件: {0}'.format(args.old_artifact))
     print('new 文件: {0}'.format(args.new_artifact))
     print('输出文件: {0}'.format(args.output_file))
@@ -751,15 +774,15 @@ def main():
         '准备写入 Hive: {0}.{1}, 分区 data_dt={2}'.format(
             hive_config['database'],
             hive_config['table'],
-            args.data_dt,
+            partition_dt,
         )
     )
-    loaded_rows = load_compare_csv_to_hive(args.output_file, hive_config, args.data_dt)
+    loaded_rows = load_compare_csv_to_hive(args.output_file, hive_config, partition_dt)
     print(
         'Hive 写入完成: {0}.{1}, 分区 data_dt={2}, 行数 {3}'.format(
             hive_config['database'],
             hive_config['table'],
-            args.data_dt,
+            partition_dt,
             loaded_rows,
         )
     )

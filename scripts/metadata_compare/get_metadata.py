@@ -158,8 +158,8 @@ def main():
 
     # 输出路径
     if not args.output_csv:
-        csv_dir = config.get('csv_dir', 'output')
-        args.output_csv = os.path.join(csv_dir, f'{datetime.date.today().strftime("%Y%m%d")}/{args.data_dt}_{args.cluster}_table_stats.csv')
+        file_dir = config.get('file_dir', 'output')
+        args.output_csv = os.path.join(file_dir, f'{datetime.date.today().strftime("%Y%m%d")}/{args.data_dt}_{args.cluster}_table_stats.csv')
 
     # 命令行参数覆盖配置
     if args.mysql_host:

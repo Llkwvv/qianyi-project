@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Generate per-cluster metric artifacts by executing Hive SQL in parallel.
+Generate per-cluster metric artifacts by executing Hive SQL.
+
+Default PyHive mode uses the async scheduler:
+- submit with ``async_=True``
+- return immediately after submit
+- keep filling in-flight slots until the configured limit
+- fetch and write results only after a task finishes
 """
 
 import argparse
@@ -12,8 +18,12 @@ import shlex
 import subprocess
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from decimal import Decimal
+from hive_async_scheduler import (
+    DelimitedRowWriter,
+    HiveAsyncScheduler,
+    build_scheduler_runtime,
+    resolve_cluster_connection,
+)
 
 # 尝试导入 pyhive，如果失败则使用 beeline 模式
 try:
@@ -38,11 +48,9 @@ class HiveConnectionPool:
         self.use_tez = use_tez
         self.pool = []
         self.lock = threading.Lock()
-        self._init_pool()
-
-    def _init_pool(self):
-        """预创建指定数量的连接"""
-        for _ in range(self.max_connections):
+        self.condition = threading.Condition(self.lock)
+        # 预创建连接池
+        for _ in range(max_connections):
             conn = self._create_connection()
             self.pool.append(conn)
 
@@ -74,34 +82,41 @@ class HiveConnectionPool:
         print('[连接池] 创建新连接 #{0} 成功'.format(conn_id))
         return conn
 
-    def get_connection(self):
-        """从连接池获取一个连接"""
+    def get_connection(self, wait_timeout=60):
+        """从连接池获取一个连接，如果池为空则等待"""
         import threading
+        import time
         task_name = threading.current_thread().name
-        with self.lock:
-            if self.pool:
-                conn = self.pool.pop()
-                # 检查连接是否仍然有效
-                try:
-                    conn.ping()
-                except Exception:
-                    # 连接失效，重新创建
-                    conn = self._create_connection()
-                print('[连接池] 任务 {0} 复用连接 #{1} (池中剩余: {2}, 总连接数: {3})'.format(
-                    task_name, conn._conn_id, len(self.pool), self.max_connections))
-                return conn
-            else:
-                # 池已空，创建新连接
-                conn = self._create_connection()
-                print('[连接池] 任务 {0} 使用新连接 #{1} (池为空, 总连接数: {2})'.format(
-                    task_name, conn._conn_id, self.max_connections))
-                return conn
+
+        with self.condition:
+            while True:
+                if self.pool:
+                    conn = self.pool.pop()
+                    # 检查连接是否仍然有效
+                    try:
+                        conn.ping()
+                        print('[连接池] 任务 {0} 复用连接 #{1} (池中剩余: {2})'.format(
+                            task_name, conn._conn_id, len(self.pool)))
+                        return conn
+                    except Exception:
+                        # 连接失效，关闭并继续获取下一个
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        continue
+                else:
+                    # 池已空，等待其他线程归还
+                    print('[连接池] 任务 {0} 等待连接归还 (池为空)...'.format(task_name))
+                    # 使用 condition.wait 等待，避免死锁
+                    self.condition.wait(timeout=1)
+                    # 继续循环尝试获取连接
 
     def return_connection(self, conn):
         """归还连接到池中"""
         import threading
         task_name = threading.current_thread().name
-        with self.lock:
+        with self.condition:
             if len(self.pool) < self.max_connections:
                 self.pool.append(conn)
                 print('[连接池] 任务 {0} 归还连接 #{1} (池中现有: {2})'.format(
@@ -110,6 +125,8 @@ class HiveConnectionPool:
                 conn.close()
                 print('[连接池] 任务 {0} 关闭连接 #{1}'.format(
                     task_name, conn._conn_id))
+            # 通知等待的线程
+            self.condition.notify_all()
 
     def close_all(self):
         """关闭所有连接"""
@@ -127,7 +144,7 @@ _global_pool = None
 _pool_lock = threading.Lock()
 
 
-def get_hive_connection_pool(cluster_config, max_connections=4, use_tez=True):
+def get_hive_connection_pool(cluster_config, max_connections=5, use_tez=True):
     """获取或创建全局 Hive 连接池"""
     global _global_pool
 
@@ -199,15 +216,15 @@ def load_env_config(config_path='env_config.json'):
         return json.load(f)
 
 
-def get_artifact_dir(config):
-    """Return the base directory used for artifacts."""
-    return config.get('artifact_dir') or config.get('csv_dir') or 'output'
+def get_file_dir(config):
+    """Return the base directory used for output files."""
+    return config.get('file_dir') or 'output'
 
 
 def get_runtime_config(config):
     """Return runtime settings with safe defaults."""
     runtime = config.get('runtime', {}).copy()
-    runtime.setdefault('max_workers', 4)
+    runtime.setdefault('max_connections', 4)
     runtime.setdefault('max_retries', 0)
     runtime.setdefault('query_timeout_sec', 1800)
     runtime.setdefault('poll_interval_sec', 300)
@@ -215,13 +232,40 @@ def get_runtime_config(config):
     return runtime
 
 
+def normalize_run_dt(value):
+    """Normalize CLI date input to yyyymmdd."""
+    stripped = (value or '').strip()
+    if re.fullmatch(r'\d{8}', stripped):
+        return stripped
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', stripped):
+        return stripped.replace('-', '')
+    raise ValueError(
+        '--data-dt 格式错误: {0}，期望 yyyymmdd 或 yyyy-mm-dd'.format(value)
+    )
+
+
+def to_partition_dt(run_dt):
+    """Convert yyyymmdd to yyyy-mm-dd for Hive partition filters."""
+    if not re.fullmatch(r'\d{8}', run_dt):
+        raise ValueError('run_dt 格式错误: {0}，期望 yyyymmdd'.format(run_dt))
+    return '{0}-{1}-{2}'.format(run_dt[0:4], run_dt[4:6], run_dt[6:8])
+
+
 def get_cluster_config(config, cluster_name):
-    """Return a named cluster config or raise a helpful error."""
+    """Return the shared cluster config while keeping cluster_name as a logical label."""
+    cluster_config = config.get('cluster')
+    if cluster_config:
+        return cluster_config.copy()
+
+    # 兼容旧配置结构，避免其他调用方尚未同步时直接报错。
     clusters = config.get('clusters', {})
-    cluster_config = clusters.get(cluster_name)
-    if not cluster_config:
-        raise ValueError('未在 env_config.json 中找到集群配置: {0}'.format(cluster_name))
-    return cluster_config
+    legacy_cluster_config = clusters.get(cluster_name)
+    if legacy_cluster_config:
+        return legacy_cluster_config.copy()
+
+    raise ValueError(
+        '未在 env_config.json 中找到集群配置，请配置 cluster 节点'
+    )
 
 
 def build_default_artifact_path(base_dir, data_dt, cluster_name):
@@ -264,15 +308,20 @@ def split_sql_statements(sql_text):
     return statements
 
 
-def load_sql_tasks(sql_file, data_dt):
-    """Read SQL tasks from file and render the date placeholder."""
+def load_sql_tasks(sql_file, partition_dt, run_dt):
+    """Read SQL tasks from file and render date placeholders."""
     with open(sql_file, 'r', encoding='utf-8') as f:
         sql_text = f.read()
 
     statements = split_sql_statements(sql_text)
     rendered = []
     for statement in statements:
-        rendered.append(statement.replace('{{data_dt}}', data_dt))
+        rendered.append(
+            statement
+            .replace('{{data_dt}}', partition_dt)
+            .replace('{{partition_dt}}', partition_dt)
+            .replace('{{run_dt}}', run_dt)
+        )
     return rendered
 
 
@@ -327,6 +376,11 @@ def build_beeline_command(cluster_config, sql):
         '{0}@{1}'.format(ssh_user, ssh_host),
         remote_cmd,
     ]
+
+
+def format_shell_command(cmd_parts):
+    """Format a command list for printing/copy-paste."""
+    return ' '.join(shlex.quote(str(part)) for part in cmd_parts)
 
 
 def parse_beeline_tsv(stdout_text):
@@ -384,7 +438,7 @@ def normalize_beeline_field(value):
     return stripped
 
 
-def execute_hive_sql(cluster_name, cluster_config, sql, timeout_sec):
+def execute_hive_sql(cluster_name, cluster_config, sql, timeout_sec, config):
     """Execute one Hive SQL and return exactly one row as a dict.
 
     仅使用 Tez 连接池模式，不支持回退。
@@ -392,19 +446,20 @@ def execute_hive_sql(cluster_name, cluster_config, sql, timeout_sec):
     if not HIVE_DRIVER_AVAILABLE:
         raise RuntimeError('pyhive 未安装，无法使用 Tez 连接池模式')
 
-    return _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec)
+    return _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec, config)
 
 
-def _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec):
+def _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec, config):
     """使用连接池执行 Hive SQL（带超时）"""
     import threading
     import socket
-    # 从配置中获取最大并发数
-    max_workers = cluster_config.get('max_workers', 4)
+    # 从配置中获取最大并发数（从 runtime 配置读取，不是 cluster 配置）
+    runtime_config = config.get('runtime', {})
+    max_connections = runtime_config.get('max_connections', 4)
     use_tez = cluster_config.get('use_tez', True)
 
     # 获取或创建连接池
-    pool = get_hive_connection_pool(cluster_config, max_workers, use_tez)
+    pool = get_hive_connection_pool(cluster_config, max_connections, use_tez)
 
     # 从连接池获取连接
     conn = pool.get_connection()
@@ -503,6 +558,48 @@ def _execute_hive_sql_with_beeline(cluster_name, cluster_config, sql, timeout_se
     return dict(zip(header, data_rows[0]))
 
 
+def run_beeline_loop(cluster_name, cluster_config, tasks, timeout_sec, output_file):
+    """单线程循环执行：每条 SQL 启动一次 beeline，解析结果并写入 TSV。"""
+    writer = DelimitedRowWriter(output_file, ARTIFACT_FIELDNAMES, '\t')
+    row_count = 0
+
+    for index, sql in enumerate(tasks):
+        print('\n[beeline-loop] 开始执行 {0}/{1}'.format(index + 1, len(tasks)))
+        cmd = build_beeline_command(cluster_config, sql)
+        print('[beeline-loop] command: {0}'.format(format_shell_command(cmd)))
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+        )
+        if result.returncode != 0:
+            stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
+            raise RuntimeError(
+                'beeline 执行失败 (cluster={0}, index={1}, rc={2}): {3}'.format(
+                    cluster_name, index + 1, result.returncode, stderr_text or '无错误输出'
+                )
+            )
+
+        stdout_text = result.stdout.decode('utf-8', errors='replace')
+        header, data_rows = parse_beeline_tsv(stdout_text)
+        if len(data_rows) != 1:
+            raise ValueError(
+                '集群 {0} 的 SQL 结果必须是 1 行，实际为 {1} 行 (index={2})'.format(
+                    cluster_name, len(data_rows), index + 1
+                )
+            )
+
+        result_row = dict(zip(header, data_rows[0]))
+        rows = normalize_metric_rows(cluster_name, result_row)
+        writer.write_rows(rows)
+        row_count += len(rows)
+        print('[beeline-loop] 完成 {0}/{1}，新增 {2} 行指标'.format(
+            index + 1, len(tasks), len(rows)))
+
+    return row_count
+
+
 def normalize_metric_rows(cluster_name, result_row):
     """Expand one wide result row into metric artifact rows."""
     missing_columns = [col for col in BASE_RESULT_COLUMNS if col not in result_row]
@@ -570,7 +667,42 @@ def write_artifact_tsv(file_path, rows):
     atomic_write_delimited(file_path, ARTIFACT_FIELDNAMES, rows, '\t', True)
 
 
-def run_task(task_index, cluster_name, cluster_config, sql, timeout_sec, max_retries):
+def write_ok_file(target_file):
+    """Create a same-name .ok marker file after successful processing."""
+    ok_file = '{0}.ok'.format(target_file)
+    ensure_parent_dir(ok_file)
+    with open(ok_file, 'w', encoding='utf-8') as f:
+        f.write('ok\n')
+    return ok_file
+
+
+class ArtifactResultProcessor(object):
+    """Write normalized metric rows as soon as each task finishes."""
+
+    def __init__(self, cluster_name, output_file):
+        self.cluster_name = cluster_name
+        self.writer = DelimitedRowWriter(output_file, ARTIFACT_FIELDNAMES, '\t')
+        self.row_count = 0
+
+    def __call__(self, task, result_row):
+        rows = normalize_metric_rows(self.cluster_name, result_row)
+        self.writer.write_rows(rows)
+        self.row_count += len(rows)
+
+
+def run_async_scheduler(cluster_name, cluster_config, runtime, tasks, output_file):
+    """Run the default PyHive async submitter for metric generation."""
+    processor = ArtifactResultProcessor(cluster_name, output_file)
+    scheduler = HiveAsyncScheduler(
+        resolve_cluster_connection(cluster_config),
+        build_scheduler_runtime(runtime),
+        result_processor=processor,
+    )
+    summary = scheduler.run(tasks)
+    return summary, processor
+
+
+def run_task(task_index, cluster_name, cluster_config, sql, timeout_sec, max_retries, config):
     """Run one SQL task with retries and return expanded rows."""
     attempt = 0
     last_error = None
@@ -578,7 +710,7 @@ def run_task(task_index, cluster_name, cluster_config, sql, timeout_sec, max_ret
 
     while attempt < max_attempts:
         try:
-            result_row = execute_hive_sql(cluster_name, cluster_config, sql, timeout_sec)
+            result_row = execute_hive_sql(cluster_name, cluster_config, sql, timeout_sec, config)
             return task_index, normalize_metric_rows(cluster_name, result_row)
         except Exception as exc:
             last_error = exc
@@ -593,70 +725,360 @@ def run_task(task_index, cluster_name, cluster_config, sql, timeout_sec, max_ret
     )
 
 
+def execute_hive_sql_fast_beeline(cluster_name, cluster_config, sql, timeout_sec):
+    """使用 beeline 命令执行 Hive SQL，快速提交模式（不等待结果）"""
+    import subprocess
+    import threading
+
+    cmd = build_beeline_command(cluster_config, sql)
+
+    # 使用 Popen 启动进程，不等待完成
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # 返回进程对象，稍后获取结果
+    return process
+
+
+def wait_beeline_result(process, task_index, cluster_name, timeout_sec):
+    """等待 beeline 进程完成并获取结果"""
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_sec)
+
+        if process.returncode != 0:
+            stderr_text = stderr.decode('utf-8', errors='replace').strip()
+            raise RuntimeError(
+                '集群 {0} 执行失败，返回码 {1}: {2}'.format(
+                    cluster_name, process.returncode, stderr_text or '无错误输出'
+                )
+            )
+
+        stdout_text = stdout.decode('utf-8', errors='replace')
+        header, data_rows = parse_beeline_tsv(stdout_text)
+
+        if len(data_rows) != 1:
+            raise ValueError(
+                '集群 {0} 的 SQL 结果必须是 1 行，实际为 {1} 行'.format(
+                    cluster_name, len(data_rows)
+                )
+            )
+
+        return dict(zip(header, data_rows[0]))
+
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise RuntimeError(
+            '集群 {0} 执行超时 (超过 {1} 秒)'.format(cluster_name, timeout_sec)
+        )
+
+
+def run_beeline_persistent(cluster_name, cluster_config, tasks, timeout_sec, max_processes=5, max_pending=30):
+    """使用持久 beeline 进程执行任务，每个进程持续运行，不断提交新任务"""
+    import queue
+    import time
+    import threading
+    import subprocess
+
+    # 任务队列（所有 worker 共享）
+    task_queue = queue.Queue()
+    for i, sql in enumerate(tasks):
+        task_queue.put((i, sql))
+
+    total_tasks = len(tasks)
+    completed_results = {}  # {task_index: result}
+    lock = threading.Lock()
+
+    def worker_thread(worker_id):
+        """工作线程：维护一个持久的 beeline 进程，不断处理任务"""
+        beeline_cmd = cluster_config.get('beeline_cmd', 'beeline')
+        beeline_url = cluster_config.get('beeline_url')
+        username = cluster_config.get('username', 'atguigu')
+
+        # 启动持久 beeline 进程
+        cmd = [
+            beeline_cmd,
+            '-u', beeline_url,
+            '--outputformat=tsv',
+            '--showHeader=true',
+            '--silent=false',
+            '-n', username,
+        ]
+
+        print('[Worker {0}] 启动 beeline 进程'.format(worker_id))
+
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
+        stdin = process.stdin
+        stdout = process.stdout
+
+        # 设置非阻塞读取
+        import fcntl
+        import os
+        flags = fcntl.fcntl(stdout.fileno(), fcntl.F_GETFL)
+        fcntl.fcntl(stdout.fileno(), fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        current_task_index = None
+        current_sql = None
+        output_buffer = []
+        waiting_for_result = False
+
+        while True:
+            # 1. 如果没有正在执行的任务，从队列获取新任务
+            if current_task_index is None:
+                try:
+                    task_index, sql = task_queue.get_nowait()
+                    current_task_index = task_index
+                    current_sql = sql
+                    output_buffer = []
+                    waiting_for_result = True
+
+                    # 提交 SQL
+                    print('\n[Worker {0}] 即将执行任务 {1}/{2}'.format(
+                        worker_id, task_index + 1, total_tasks))
+                    print(sql.strip())
+                    stdin.write(sql + ';\n')
+                    stdin.flush()
+                    print('[Worker {0}] 任务 {1} 已提交'.format(worker_id, task_index + 1))
+
+                except queue.Empty:
+                    pass
+
+            # 2. 尝试读取输出
+            if waiting_for_result:
+                try:
+                    while True:
+                        line = stdout.readline()
+                        if not line:
+                            break
+                        output_buffer.append(line.rstrip())
+
+                        # 检测任务完成（看到新的 jdbc 提示符）
+                        if 'jdbc:' in line.lower() and '>' in line:
+                            # 检查是否是命令执行完成的提示符
+                            if len(output_buffer) > 2:
+                                waiting_for_result = False
+                                break
+
+                except:
+                    pass
+
+                # 如果收集到完整结果，解析它
+                if not waiting_for_result and output_buffer:
+                    try:
+                        # 解析 TSV 输出
+                        filtered = [l for l in output_buffer if l and '\t' in l]
+                        if filtered:
+                            header = filtered[0].split('\t')
+                            data = filtered[1].split('\t')
+                            result = dict(zip(header, data))
+
+                            with lock:
+                                completed_results[current_task_index] = result
+
+                            print('[Worker {0}] 任务 {1} 完成!'.format(worker_id, current_task_index + 1))
+
+                        current_task_index = None
+                        current_sql = None
+                        output_buffer = []
+
+                    except Exception as e:
+                        print('[Worker {0}] 解析错误: {1}'.format(worker_id, e))
+                        current_task_index = None
+                        output_buffer = []
+
+            # 3. 检查任务队列是否全部完成
+            with lock:
+                if len(completed_results) >= total_tasks:
+                    break
+
+            # 4. 短暂等待
+            time.sleep(0.1)
+
+        # 退出 beeline
+        try:
+            stdin.write('!quit\n')
+            stdin.flush()
+            process.wait(timeout=5)
+        except:
+            process.kill()
+
+        print('[Worker {0}] 退出'.format(worker_id))
+
+    # 启动工作线程
+    print('\n[开始] 启动 {0} 个持久 beeline 进程...'.format(max_processes))
+    threads = []
+    for i in range(max_processes):
+        t = threading.Thread(target=worker_thread, args=(i,))
+        t.start()
+        threads.append(t)
+
+    # 等待所有任务完成
+    start_time = time.time()
+    while True:
+        with lock:
+            completed = len(completed_results)
+        if completed >= total_tasks:
+            break
+        if time.time() - start_time > timeout_sec:
+            print('[超时] 任务执行超时')
+            break
+        time.sleep(0.5)
+
+    elapsed = time.time() - start_time
+    print('\n[完成] 全部任务完成! 总耗时: {0:.2f}s'.format(elapsed))
+
+    # 等待线程结束
+    for t in threads:
+        t.join(timeout=5)
+
+    # 按顺序返回结果
+    results = []
+    for i in range(total_tasks):
+        if i in completed_results:
+            results.append((i, normalize_metric_rows(cluster_name, completed_results[i])))
+        else:
+            print('警告: 任务 {0} 未完成'.format(i))
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description='执行 Hive SQL 并生成指标中间结果文件')
     parser.add_argument('--sql-file', required=True, help='SQL 文件路径')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 2024-01-01')
-    parser.add_argument('--cluster', required=True, help='集群名称，如 old 或 new')
+    parser.add_argument('--cluster', required=True, help='逻辑集群标识，用于区分生成文件名称')
     parser.add_argument('--output-file', help='输出 TSV 文件路径')
+    parser.add_argument('--beeline-loop', action='store_true',
+                        help='单线程循环：每条 SQL 启动一次 beeline 并等待结果')
     parser.add_argument('--use-beeline', action='store_true',
                         help='强制使用 beeline 模式，不使用连接池')
+    parser.add_argument('--max-processes', type=int, default=5,
+                        help='最大 beeline 进程数 (默认 5)')
+    parser.add_argument('--max-pending', type=int, default=30,
+                        help='最大等待提交的任务数 (默认 30)')
     args = parser.parse_args()
 
     config = load_env_config()
     runtime = get_runtime_config(config)
+    run_dt = normalize_run_dt(args.data_dt)
+    partition_dt = to_partition_dt(run_dt)
     cluster_config = get_cluster_config(config, args.cluster)
 
     # 强制使用 beeline 模式
-    if args.use_beeline:
+    if args.use_beeline or args.beeline_loop:
         cluster_config['use_tez'] = False
 
     if not args.output_file:
-        artifact_dir = get_artifact_dir(config)
-        args.output_file = build_default_artifact_path(artifact_dir, args.data_dt, args.cluster)
+        artifact_dir = get_file_dir(config)
+        args.output_file = build_default_artifact_path(artifact_dir, run_dt, args.cluster)
 
-    tasks = load_sql_tasks(args.sql_file, args.data_dt)
+    # 确保输出目录存在
+    ensure_parent_dir(args.output_file)
+
+    tasks = load_sql_tasks(args.sql_file, partition_dt, run_dt)
     if not tasks:
         raise ValueError('SQL 文件中未解析到可执行语句: {0}'.format(args.sql_file))
 
     print('集群: {0}'.format(args.cluster))
+    print('运行日期: {0}'.format(run_dt))
+    print('分区日期: {0}'.format(partition_dt))
     print('SQL 数量: {0}'.format(len(tasks)))
+    for index, sql in enumerate(tasks):
+        print('\n[SQL {0}/{1}]'.format(index + 1, len(tasks)))
+        print(sql.strip())
     print('输出文件: {0}'.format(args.output_file))
     print('执行引擎: {0}'.format(
-        'beeline' if args.use_beeline or not HIVE_DRIVER_AVAILABLE else 'Tez连接池'))
+        'beeline-loop (单线程)' if args.beeline_loop else
+        ('beeline (有限并发模式)' if args.use_beeline or not HIVE_DRIVER_AVAILABLE else 'PyHive 异步调度器')
+    ))
+    print('最大进程数: {0}, 最大等待任务数: {1}'.format(args.max_processes, args.max_pending))
 
-    try:
-        results_by_index = {}
-        with ThreadPoolExecutor(max_workers=runtime['max_workers']) as executor:
-            future_map = {}
-            for index, sql in enumerate(tasks):
-                future = executor.submit(
-                    run_task,
-                    index,
-                    args.cluster,
-                    cluster_config,
-                    sql,
-                    runtime['query_timeout_sec'],
-                    runtime['max_retries'],
+    if args.beeline_loop:
+        row_count = run_beeline_loop(
+            args.cluster,
+            cluster_config,
+            tasks,
+            runtime['query_timeout_sec'],
+            args.output_file,
+        )
+        print('\n中间结果已生成: {0}'.format(args.output_file))
+        print('共输出 {0} 条指标记录'.format(row_count))
+        ok_file = write_ok_file(args.output_file)
+        print('完成标记文件: {0}'.format(ok_file))
+        return
+
+    # 使用 beeline 持久进程模式
+    if args.use_beeline or not HIVE_DRIVER_AVAILABLE:
+        results_list = run_beeline_persistent(
+            args.cluster,
+            cluster_config,
+            tasks,
+            runtime['query_timeout_sec'],
+            max_processes=args.max_processes,
+            max_pending=args.max_pending
+        )
+        results_by_index = {index: rows for index, rows in results_list}
+
+    else:
+        scheduler_runtime = build_scheduler_runtime(runtime)
+        print('异步提交配置: max_connections={0}, max_inflight_tasks={1}'.format(
+            scheduler_runtime['max_connections'],
+            scheduler_runtime['max_inflight_tasks'],
+        ))
+        print('提交策略: execute(async_=True) 返回后立即继续提交下一个任务')
+
+        summary, processor = run_async_scheduler(
+            args.cluster,
+            cluster_config,
+            runtime,
+            tasks,
+            args.output_file,
+        )
+        print('\n异步调度完成')
+        print('成功任务: {0}'.format(len(summary['finished'])))
+        print('失败任务: {0}'.format(len(summary['failed'])))
+        print('最大 in-flight: {0}'.format(summary['max_observed_inflight']))
+        print('总耗时: {0:.2f}s'.format(summary['elapsed_sec']))
+        print('\n中间结果已生成: {0}'.format(args.output_file))
+        print('共输出 {0} 条指标记录'.format(processor.row_count))
+
+        if summary['failed']:
+            failed_preview = []
+            for task in summary['failed'][:5]:
+                failed_preview.append(
+                    'task {0}: {1}'.format(task.task_id, task.error)
                 )
-                future_map[future] = index
+            raise RuntimeError(
+                '存在失败任务，共 {0} 个: {1}'.format(
+                    len(summary['failed']),
+                    '; '.join(failed_preview),
+                )
+            )
+        ok_file = write_ok_file(args.output_file)
+        print('完成标记文件: {0}'.format(ok_file))
+        return
 
-            for future in as_completed(future_map):
-                task_index, rows = future.result()
-                results_by_index[task_index] = rows
-                print('任务完成: {0}'.format(task_index + 1))
-
-        all_rows = []
-        for index in range(len(tasks)):
+    # 汇总结果
+    all_rows = []
+    for index in range(len(tasks)):
+        if index in results_by_index:
             all_rows.extend(results_by_index[index])
 
-        write_artifact_tsv(args.output_file, all_rows)
-        print('中间结果已生成: {0}'.format(args.output_file))
-        print('共输出 {0} 条指标记录'.format(len(all_rows)))
-    finally:
-        # 确保连接池总是被关闭
-        close_hive_connection_pool()
-        print('连接池已关闭')
+    write_artifact_tsv(args.output_file, all_rows)
+    print('\n中间结果已生成: {0}'.format(args.output_file))
+    print('共输出 {0} 条指标记录'.format(len(all_rows)))
+    ok_file = write_ok_file(args.output_file)
+    print('完成标记文件: {0}'.format(ok_file))
 
 
 if __name__ == '__main__':

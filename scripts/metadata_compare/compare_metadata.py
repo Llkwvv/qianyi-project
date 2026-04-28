@@ -350,9 +350,9 @@ def load_to_hive_simple(csv_file: str, hive_config: dict, data_dt: str, output_d
 def main():
     parser = argparse.ArgumentParser(description='比较两个集群的表行数差异并导出到CSV/Hive')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 20250324')
-    parser.add_argument('--old-csv', help='旧集群CSV文件路径（可选，默认从csv_dir读取）')
-    parser.add_argument('--new-csv', help='新集群CSV文件路径（可选，默认从csv_dir读取）')
-    parser.add_argument('--output-dir', help='输出目录（可选，默认从csv_dir读取）')
+    parser.add_argument('--old-csv', help='旧集群CSV文件路径（可选，默认从file_dir读取）')
+    parser.add_argument('--new-csv', help='新集群CSV文件路径（可选，默认从file_dir读取）')
+    parser.add_argument('--output-dir', help='输出目录（可选，默认从file_dir读取）')
     parser.add_argument('--hive-table', help='Hive表名（可选，默认从配置读取）')
     parser.add_argument('--skip-hive', action='store_true', help='跳过Hive加载步骤')
 
@@ -360,17 +360,17 @@ def main():
 
     # 加载配置
     config = load_env_config()
-    csv_dir = config.get('csv_dir')
+    file_dir = config.get('file_dir')
 
-    # 输出目录使用csv_dir
-    output_dir = csv_dir
+    # 输出目录使用 file_dir
+    output_dir = file_dir
 
     # 自动拼接文件路径
     today = args.data_dt
     if not args.old_csv:
-        args.old_csv = os.path.join(csv_dir, f'{args.data_dt}/{args.data_dt}_old_table_stats.csv')
+        args.old_csv = os.path.join(file_dir, f'{args.data_dt}/{args.data_dt}_old_table_stats.csv')
     if not args.new_csv:
-        args.new_csv = os.path.join(csv_dir, f'{args.data_dt}/{args.data_dt}_new_table_stats.csv')
+        args.new_csv = os.path.join(file_dir, f'{args.data_dt}/{args.data_dt}_new_table_stats.csv')
 
     print(f"旧集群CSV: {args.old_csv}")
     print(f"新集群CSV: {args.new_csv}")
