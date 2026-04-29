@@ -429,7 +429,7 @@ def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
     # 读取CSV文件
     print('读取CSV文件: {0}'.format(csv_file))
     with open(csv_file, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
         rows = list(reader)
 
     if not rows:
@@ -437,6 +437,10 @@ def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
         return 0
 
     print('共 {0} 条数据需要写入Hive'.format(len(rows)))
+
+    # 用 COMPARE_FIELDNAMES 作为字段名
+    fieldnames = COMPARE_FIELDNAMES
+    rows = [dict(zip(fieldnames, row)) for row in rows]
 
     # 批量插入数据
     batch_size = 100
