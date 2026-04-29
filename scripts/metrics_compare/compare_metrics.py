@@ -9,7 +9,6 @@ import datetime
 import json
 import os
 import re
-import shlex
 import subprocess
 import tempfile
 from datetime import date
@@ -114,7 +113,7 @@ def ensure_parent_dir(file_path):
 
 
 def build_beeline_command(cluster_config, sql):
-    """Build a beeline command, optionally wrapped by ssh."""
+    """Build a beeline command."""
     beeline_cmd = cluster_config.get('beeline_cmd', 'beeline')
     beeline_url = cluster_config.get('beeline_url')
     if not beeline_url:
@@ -145,22 +144,7 @@ def build_beeline_command(cluster_config, sql):
     if extra_args:
         base_cmd.extend(extra_args)
 
-    if not cluster_config.get('use_ssh'):
-        return base_cmd
-
-    ssh_host = cluster_config.get('ssh_host')
-    ssh_user = cluster_config.get('ssh_user')
-    ssh_port = cluster_config.get('ssh_port', 22)
-    if not ssh_host or not ssh_user:
-        raise ValueError('SSH 模式缺少 ssh_host 或 ssh_user 配置')
-
-    remote_cmd = ' '.join(shlex.quote(part) for part in base_cmd)
-    return [
-        'ssh',
-        '-p', str(ssh_port),
-        '{0}@{1}'.format(ssh_user, ssh_host),
-        remote_cmd,
-    ]
+    return base_cmd
 
 
 def parse_beeline_tsv(stdout_text):
@@ -507,6 +491,72 @@ WHERE data_dt = '{data_dt}'
     return rows[0][0]
 
 
+def load_compare_csv_to_hive_using_load(csv_file, hive_config, data_dt):
+    """通过LOAD DATA LOCAL INPATH方式将对比CSV写入Hive表"""
+    if not os.path.exists(csv_file):
+        raise ValueError('对比结果文件不存在: {0}'.format(csv_file))
+
+    hive_database = hive_config['database']
+    hive_table = hive_config['table']
+
+    # 检查CSV文件是否有数据
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    if not rows:
+        print('CSV文件没有数据')
+        return 0
+
+    print('共 {0} 条数据需要通过LOAD方式写入Hive'.format(len(rows)))
+
+    # 获取CSV文件的绝对路径
+    csv_file_path = os.path.abspath(csv_file)
+
+    # 构建LOAD DATA语句
+    # 注意：Hive的LOAD DATA LOCAL INPATH是从本地文件系统加载
+    # 需要确保CSV文件路径是Hive可以访问的路径
+    load_sql = """
+LOAD DATA LOCAL INPATH '{csv_file_path}'
+INTO TABLE {hive_database}.{hive_table}
+PARTITION (data_dt='{data_dt}')
+""".format(
+        csv_file_path=csv_file_path,
+        hive_database=hive_database,
+        hive_table=hive_table,
+        data_dt=data_dt,
+    )
+
+    print('正在执行LOAD DATA语句...')
+    load_result = run_beeline_sql(hive_config, load_sql)
+    if load_result.returncode != 0:
+        stderr = load_result.stderr.decode('utf-8', errors='replace').strip()
+        raise RuntimeError('LOAD DATA 失败: {0}'.format(stderr or '无错误输出'))
+
+    print('数据已通过LOAD方式写入 Hive')
+
+    # Verify
+    count_sql = """
+SELECT count(1) as row_count
+FROM {database_name}.{table_name}
+WHERE data_dt = '{data_dt}'
+""".format(
+        database_name=hive_database,
+        table_name=hive_table,
+        data_dt=data_dt,
+    )
+    count_result = run_beeline_sql(hive_config, count_sql)
+    if count_result.returncode != 0:
+        stderr = count_result.stderr.decode('utf-8', errors='replace').strip()
+        raise RuntimeError('校验 Hive 表失败: {0}'.format(stderr or '无错误输出'))
+
+    header, rows = parse_beeline_tsv(count_result.stdout.decode('utf-8', errors='replace'))
+    if header != ['row_count'] or len(rows) != 1:
+        raise RuntimeError('校验 Hive 表返回异常: header={0}, rows={1}'.format(header, rows))
+
+    return rows[0][0]
+
+
 def main():
     parser = argparse.ArgumentParser(description='对比新旧集群的指标中间结果文件')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 2024-01-01')
@@ -514,6 +564,12 @@ def main():
     parser.add_argument('--old-artifact', help='旧集群 TSV 文件路径')
     parser.add_argument('--new-artifact', help='新集群 TSV 文件路径')
     parser.add_argument('--output-file', help='输出结果 CSV 路径')
+    parser.add_argument(
+        '--load-mode',
+        choices=['insert', 'load'],
+        default='load',
+        help='写入Hive的方式: insert 或 load(默认)'
+    )
     args = parser.parse_args()
 
     config = load_env_config()
@@ -564,13 +620,18 @@ def main():
     hive_config = config.get('hive', {}).copy()
 
     print(
-        '准备写入 Hive: {0}.{1}, 分区 data_dt={2}'.format(
+        '准备写入 Hive: {0}.{1}, 分区 data_dt={2}, 模式={3}'.format(
             hive_config['database'],
             hive_config['table'],
             partition_dt,
+            args.load_mode,
         )
     )
-    loaded_rows = load_compare_csv_to_hive(args.output_file, hive_config, partition_dt)
+
+    if args.load_mode == 'load':
+        loaded_rows = load_compare_csv_to_hive_using_load(args.output_file, hive_config, partition_dt)
+    else:
+        loaded_rows = load_compare_csv_to_hive(args.output_file, hive_config, partition_dt)
     print(
         'Hive 写入完成: {0}.{1}, 分区 data_dt={2}, 行数 {3}'.format(
             hive_config['database'],

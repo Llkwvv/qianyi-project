@@ -19,7 +19,6 @@
     "hive_port": 10000,
     "username": "atguigu",
     "auth": "NONE",
-    "use_ssh": false
     },
   "metastore_mysql": {
     "host": "172.20.10.6",

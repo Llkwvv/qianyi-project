@@ -14,10 +14,10 @@ import csv
 import json
 import os
 import re
-import shlex
 import subprocess
 import tempfile
 import threading
+from datetime import date
 from hive_async_scheduler import (
     DelimitedRowWriter,
     HiveAsyncScheduler,
@@ -258,9 +258,11 @@ def get_cluster_config(config, cluster_name):
     )
 
 
-def build_default_artifact_path(base_dir, data_dt, cluster_name):
+def build_default_artifact_path(base_dir, data_dt, cluster_name, folder_date=None):
     """Build the default per-cluster artifact path."""
-    return os.path.join(base_dir, data_dt, '{0}_{1}_table_metrics.tsv'.format(data_dt, cluster_name))
+    if folder_date is None:
+        folder_date = data_dt
+    return os.path.join(base_dir, folder_date, '{0}_{1}_table_metrics.tsv'.format(data_dt, cluster_name))
 
 
 def ensure_parent_dir(file_path):
@@ -347,22 +349,7 @@ def build_beeline_command(cluster_config, sql):
     if extra_args:
         base_cmd.extend(extra_args)
 
-    if not cluster_config.get('use_ssh'):
-        return base_cmd
-
-    ssh_host = cluster_config.get('ssh_host')
-    ssh_user = cluster_config.get('ssh_user')
-    ssh_port = cluster_config.get('ssh_port', 22)
-    if not ssh_host or not ssh_user:
-        raise ValueError('SSH 模式缺少 ssh_host 或 ssh_user 配置')
-
-    remote_cmd = ' '.join(shlex.quote(part) for part in base_cmd)
-    return [
-        'ssh',
-        '-p', str(ssh_port),
-        '{0}@{1}'.format(ssh_user, ssh_host),
-        remote_cmd,
-    ]
+    return base_cmd
 
 
 def format_shell_command(cmd_parts):
@@ -966,7 +953,8 @@ def main():
 
     if not args.output_file:
         artifact_dir = get_file_dir(config)
-        args.output_file = build_default_artifact_path(artifact_dir, run_dt, args.cluster)
+        folder_date = date.today().strftime('%Y%m%d')
+        args.output_file = build_default_artifact_path(artifact_dir, run_dt, args.cluster, folder_date)
 
     # 确保输出目录存在
     ensure_parent_dir(args.output_file)
