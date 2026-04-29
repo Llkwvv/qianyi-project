@@ -98,9 +98,11 @@ def build_default_artifact_path(base_dir, data_dt, cluster_name, folder_date=Non
     return os.path.join(base_dir, folder_date, '{0}_{1}_table_metrics.tsv'.format(data_dt, cluster_name))
 
 
-def build_default_compare_path(base_dir, data_dt):
+def build_default_compare_path(base_dir, data_dt, folder_date=None):
     """Build the default comparison result path."""
-    return os.path.join(base_dir, data_dt, '{0}_metric_comparison.csv'.format(data_dt))
+    if folder_date is None:
+        folder_date = data_dt
+    return os.path.join(base_dir, folder_date, '{0}_metric_comparison.csv'.format(data_dt))
 
 
 def ensure_parent_dir(file_path):
@@ -552,7 +554,7 @@ WHERE data_dt = '{data_dt}'
 def main():
     parser = argparse.ArgumentParser(description='对比新旧集群的指标中间结果文件')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 2024-01-01')
-    parser.add_argument('--cluster', required=True, help='集群名称')
+    parser.add_argument('--cluster', help='集群名称（已废弃）')
     parser.add_argument('--old-artifact', help='旧集群 TSV 文件路径')
     parser.add_argument('--new-artifact', help='新集群 TSV 文件路径')
     parser.add_argument('--output-file', help='输出结果 CSV 路径')
@@ -570,7 +572,7 @@ def main():
     if not args.new_artifact:
         args.new_artifact = build_default_artifact_path(artifact_dir, run_dt, 'new', folder_date)
     if not args.output_file:
-        args.output_file = build_default_artifact_path(artifact_dir, run_dt, args.cluster, folder_date)
+        args.output_file = build_default_compare_path(artifact_dir, run_dt)
 
     print('运行日期: {0}'.format(run_dt))
     print('分区日期: {0}'.format(partition_dt))
