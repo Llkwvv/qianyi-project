@@ -30,13 +30,12 @@ class HiveConnectionPool:
     _conn_counter = 0  # 连接计数器，用于生成唯一ID
 
     def __init__(self, host, port, username, database='default',
-                 max_connections=5, use_tez=True):
+                 max_connections=5):
         self.host = host
         self.port = port
         self.username = username
         self.database = database
         self.max_connections = max_connections
-        self.use_tez = use_tez
         self.pool = []
         self.lock = threading.Lock()
         self._init_pool()
@@ -64,12 +63,9 @@ class HiveConnectionPool:
             auth='NONE'
         )
 
-        # 设置执行引擎
+        # 设置执行引擎为 tez
         cursor = conn.cursor()
-        if self.use_tez:
-            cursor.execute("SET hive.execution.engine=tez")
-        else:
-            cursor.execute("SET hive.execution.engine=mr")
+        cursor.execute("SET hive.execution.engine=tez")
         cursor.close()
         conn._conn_id = conn_id
         print('[连接池] 创建新连接 #{0} 成功'.format(conn_id))
@@ -128,7 +124,7 @@ _global_pool = None
 _pool_lock = threading.Lock()
 
 
-def get_hive_connection_pool(cluster_config, max_connections=4, use_tez=True):
+def get_hive_connection_pool(cluster_config, max_connections=4):
     """获取或创建全局 Hive 连接池"""
     global _global_pool
 
@@ -156,8 +152,7 @@ def get_hive_connection_pool(cluster_config, max_connections=4, use_tez=True):
                 port=port,
                 username=username,
                 database=database,
-                max_connections=max_connections,
-                use_tez=use_tez
+                max_connections=max_connections
             )
     return _global_pool
 
@@ -270,8 +265,6 @@ def build_beeline_command(cluster_config, sql):
     if not beeline_url:
         raise ValueError('集群配置缺少 beeline_url')
 
-    use_tez = cluster_config.get('use_tez', True)
-
     base_cmd = [
         beeline_cmd,
         '-u', beeline_url,
@@ -280,9 +273,8 @@ def build_beeline_command(cluster_config, sql):
         '--silent=true',
     ]
 
-    # 如果不使用tez，先设置mr引擎
-    if not use_tez:
-        base_cmd.extend(['-e', 'set hive.execution.engine=mr;'])
+    # 设置 tez 引擎
+    base_cmd.extend(['-e', 'set hive.execution.engine=tez;'])
 
     base_cmd.extend(['-e', sql])
 

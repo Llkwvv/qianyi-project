@@ -151,7 +151,6 @@ def resolve_cluster_connection(cluster_config):
         'username': cluster_config.get('username', 'hive'),
         'database': database,
         'auth': cluster_config.get('auth', 'NONE'),
-        'use_tez': cluster_config.get('use_tez', True),
     }
 
 
@@ -312,10 +311,7 @@ class HiveSession(object):
             socket_obj.settimeout(self.socket_timeout_sec)
 
         cursor = self.connection.cursor()
-        if self.connection_info.get('use_tez', True):
-            cursor.execute('SET hive.execution.engine=tez')
-        else:
-            cursor.execute('SET hive.execution.engine=mr')
+        cursor.execute('SET hive.execution.engine=tez')
         cursor.close()
         return self.connection
 
@@ -613,7 +609,7 @@ def main():
     parser = argparse.ArgumentParser(description='异步提交 Hive SQL 并在完成时写出结果')
     parser.add_argument('--sql-file', required=True, help='SQL 文件路径')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 2024-01-01')
-    parser.add_argument('--cluster', required=True, help='集群名称，如 old 或 new')
+    parser.add_argument('--cluster', default='hive', help='集群名称（用于输出文件区分，默认 hive）')
     parser.add_argument('--config', default='env_config.json', help='配置文件名')
     parser.add_argument('--output-file', help='原始任务结果 TSV 输出路径')
     args = parser.parse_args()
@@ -623,9 +619,9 @@ def main():
 
     config = load_env_config(args.config)
     runtime = build_scheduler_runtime(config.get('runtime', {}))
-    cluster_config = config.get('clusters', {}).get(args.cluster)
+    cluster_config = config.get('hive')
     if not cluster_config:
-        raise ValueError('未找到集群配置: {0}'.format(args.cluster))
+        raise ValueError('未在 env_config.json 中找到 hive 配置')
 
     output_file = args.output_file
     if not output_file:

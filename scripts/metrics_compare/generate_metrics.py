@@ -39,13 +39,12 @@ class HiveConnectionPool:
     _conn_counter = 0  # 连接计数器，用于生成唯一ID
 
     def __init__(self, host, port, username, database='default',
-                 max_connections=5, use_tez=True):
+                 max_connections=5):
         self.host = host
         self.port = port
         self.username = username
         self.database = database
         self.max_connections = max_connections
-        self.use_tez = use_tez
         self.pool = []
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
@@ -71,12 +70,9 @@ class HiveConnectionPool:
             auth='NONE'
         )
 
-        # 设置执行引擎
+        # 设置执行引擎为 tez
         cursor = conn.cursor()
-        if self.use_tez:
-            cursor.execute("SET hive.execution.engine=tez")
-        else:
-            cursor.execute("SET hive.execution.engine=mr")
+        cursor.execute("SET hive.execution.engine=tez")
         cursor.close()
         conn._conn_id = conn_id
         print('[连接池] 创建新连接 #{0} 成功'.format(conn_id))
@@ -144,7 +140,7 @@ _global_pool = None
 _pool_lock = threading.Lock()
 
 
-def get_hive_connection_pool(cluster_config, max_connections=5, use_tez=True):
+def get_hive_connection_pool(cluster_config, max_connections=5):
     """获取或创建全局 Hive 连接池"""
     global _global_pool
 
@@ -172,8 +168,7 @@ def get_hive_connection_pool(cluster_config, max_connections=5, use_tez=True):
                 port=port,
                 username=username,
                 database=database,
-                max_connections=max_connections,
-                use_tez=use_tez
+                max_connections=max_connections
             )
     return _global_pool
 
@@ -253,24 +248,19 @@ def to_partition_dt(run_dt):
 
 def get_cluster_config(config, cluster_name):
     """Return the shared cluster config while keeping cluster_name as a logical label."""
-    cluster_config = config.get('cluster')
+    # 使用 hive 配置
+    cluster_config = config.get('hive')
     if cluster_config:
         return cluster_config.copy()
 
-    # 兼容旧配置结构，避免其他调用方尚未同步时直接报错。
-    clusters = config.get('clusters', {})
-    legacy_cluster_config = clusters.get(cluster_name)
-    if legacy_cluster_config:
-        return legacy_cluster_config.copy()
-
     raise ValueError(
-        '未在 env_config.json 中找到集群配置，请配置 cluster 节点'
+        '未在 env_config.json 中找到 hive 配置'
     )
 
 
 def build_default_artifact_path(base_dir, data_dt, cluster_name):
     """Build the default per-cluster artifact path."""
-    return os.path.join(base_dir, data_dt, '{0}_metrics.tsv'.format(cluster_name))
+    return os.path.join(base_dir, data_dt, '{0}_{1}_table_metrics.tsv'.format(data_dt, cluster_name))
 
 
 def ensure_parent_dir(file_path):
@@ -332,8 +322,6 @@ def build_beeline_command(cluster_config, sql):
     if not beeline_url:
         raise ValueError('集群配置缺少 beeline_url')
 
-    use_tez = cluster_config.get('use_tez', True)
-
     base_cmd = [
         beeline_cmd,
         '-u', beeline_url,
@@ -342,9 +330,8 @@ def build_beeline_command(cluster_config, sql):
         '--silent=true',
     ]
 
-    # 如果不使用tez，先设置mr引擎
-    if not use_tez:
-        base_cmd.extend(['-e', 'set hive.execution.engine=mr;'])
+    # 设置 tez 引擎
+    base_cmd.extend(['-e', 'set hive.execution.engine=tez;'])
 
     base_cmd.extend(['-e', sql])
 
@@ -380,7 +367,7 @@ def build_beeline_command(cluster_config, sql):
 
 def format_shell_command(cmd_parts):
     """Format a command list for printing/copy-paste."""
-    return ' '.join(shlex.quote(str(part)) for part in cmd_parts)
+    return ' '.join(str(part) for part in cmd_parts)
 
 
 def parse_beeline_tsv(stdout_text):
@@ -456,10 +443,9 @@ def _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec, 
     # 从配置中获取最大并发数（从 runtime 配置读取，不是 cluster 配置）
     runtime_config = config.get('runtime', {})
     max_connections = runtime_config.get('max_connections', 4)
-    use_tez = cluster_config.get('use_tez', True)
 
     # 获取或创建连接池
-    pool = get_hive_connection_pool(cluster_config, max_connections, use_tez)
+    pool = get_hive_connection_pool(cluster_config, max_connections)
 
     # 从连接池获取连接
     conn = pool.get_connection()
@@ -475,13 +461,12 @@ def _execute_hive_sql_with_pool(cluster_name, cluster_config, sql, timeout_sec, 
     task_name = threading.current_thread().name
     # 截取SQL前100个字符作为显示
     sql_preview = sql.strip()[:100].replace('\n', ' ')
-    print('[任务 {0}] 开始执行 (连接 #{1}, Tez引擎: {2}, 超时: {3}秒): {4}...'.format(
-        task_name, conn_id, use_tez, timeout_sec, sql_preview))
+    print('[任务 {0}] 开始执行 (连接 #{1}, Tez引擎: 是, 超时: {2}秒): {3}...'.format(
+        task_name, conn_id, timeout_sec, sql_preview))
 
     try:
-        # 设置执行引擎为 Tez（如果需要）
-        if use_tez:
-            cursor.execute("SET hive.execution.engine=tez")
+        # 设置执行引擎为 Tez
+        cursor.execute("SET hive.execution.engine=tez")
 
         # 打印将要执行的 SQL
         print('[任务 {0}] 提交 SQL 到 Hive...'.format(task_name))
@@ -669,7 +654,8 @@ def write_artifact_tsv(file_path, rows):
 
 def write_ok_file(target_file):
     """Create a same-name .ok marker file after successful processing."""
-    ok_file = '{0}.ok'.format(target_file)
+    base, _ = os.path.splitext(target_file)
+    ok_file = '{0}.ok'.format(base)
     ensure_parent_dir(ok_file)
     with open(ok_file, 'w', encoding='utf-8') as f:
         f.write('ok\n')
@@ -974,9 +960,9 @@ def main():
     partition_dt = to_partition_dt(run_dt)
     cluster_config = get_cluster_config(config, args.cluster)
 
-    # 强制使用 beeline 模式
+    # 强制使用 beeline 模式（仍使用 Tez 引擎）
     if args.use_beeline or args.beeline_loop:
-        cluster_config['use_tez'] = False
+        pass
 
     if not args.output_file:
         artifact_dir = get_file_dir(config)
