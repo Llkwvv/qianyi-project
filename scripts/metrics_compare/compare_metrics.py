@@ -458,7 +458,7 @@ def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
                     return 'NULL'
                 return "'{0}'".format(val.replace("'", "''"))
 
-            value = "({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7})".format(
+            value = "({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8})".format(
                 to_value(row.get('database_name')),
                 to_value(row.get('table_name')),
                 to_value(row.get('partition_name')),
@@ -466,7 +466,8 @@ def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
                 to_value(row.get('old_value')),
                 to_value(row.get('new_value')),
                 to_value(row.get('diff_value')),
-                to_value(data_dt)
+                to_value(row.get('etl_tm')),
+                to_value(row.get('data_dt'))
             )
             values_list.append(value)
 
