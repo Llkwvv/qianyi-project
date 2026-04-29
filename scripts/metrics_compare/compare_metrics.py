@@ -12,158 +12,8 @@ import re
 import shlex
 import subprocess
 import tempfile
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from decimal import Decimal
-
-# 尝试导入 pyhive，如果失败则使用 beeline 模式
-try:
-    from pyhive import hive
-    HIVE_DRIVER_AVAILABLE = True
-except ImportError:
-    HIVE_DRIVER_AVAILABLE = False
-
-
-class HiveConnectionPool:
-    """Hive 连接池，支持连接复用和 Tez 引擎"""
-
-    _conn_counter = 0  # 连接计数器，用于生成唯一ID
-
-    def __init__(self, host, port, username, database='default',
-                 max_connections=5):
-        self.host = host
-        self.port = port
-        self.username = username
-        self.database = database
-        self.max_connections = max_connections
-        self.pool = []
-        self.lock = threading.Lock()
-        self._init_pool()
-
-    def _init_pool(self):
-        """预创建指定数量的连接"""
-        for _ in range(self.max_connections):
-            conn = self._create_connection()
-            self.pool.append(conn)
-
-    def _create_connection(self):
-        """创建一个新的 Hive 连接"""
-        import socket
-        HiveConnectionPool._conn_counter += 1
-        conn_id = HiveConnectionPool._conn_counter
-
-        print('[连接池] 正在创建连接 #{0} (host={1}:{2})...'.format(
-            conn_id, self.host, self.port))
-
-        conn = hive.Connection(
-            host=self.host,
-            port=self.port,
-            username=self.username,
-            database=self.database,
-            auth='NONE'
-        )
-
-        # 设置执行引擎为 tez
-        cursor = conn.cursor()
-        cursor.execute("SET hive.execution.engine=tez")
-        cursor.close()
-        conn._conn_id = conn_id
-        print('[连接池] 创建新连接 #{0} 成功'.format(conn_id))
-        return conn
-
-    def get_connection(self):
-        """从连接池获取一个连接"""
-        import threading
-        task_name = threading.current_thread().name
-        with self.lock:
-            if self.pool:
-                conn = self.pool.pop()
-                # 检查连接是否仍然有效
-                try:
-                    conn.ping()
-                except Exception:
-                    # 连接失效，重新创建
-                    conn = self._create_connection()
-                print('[连接池] 任务 {0} 复用连接 #{1} (池中剩余: {2}, 总连接数: {3})'.format(
-                    task_name, conn._conn_id, len(self.pool), self.max_connections))
-                return conn
-            else:
-                # 池已空，创建新连接
-                conn = self._create_connection()
-                print('[连接池] 任务 {0} 使用新连接 #{1} (池为空, 总连接数: {2})'.format(
-                    task_name, conn._conn_id, self.max_connections))
-                return conn
-
-    def return_connection(self, conn):
-        """归还连接到池中"""
-        import threading
-        task_name = threading.current_thread().name
-        with self.lock:
-            if len(self.pool) < self.max_connections:
-                self.pool.append(conn)
-                print('[连接池] 任务 {0} 归还连接 #{1} (池中现有: {2})'.format(
-                    task_name, conn._conn_id, len(self.pool)))
-            else:
-                conn.close()
-                print('[连接池] 任务 {0} 关闭连接 #{1}'.format(
-                    task_name, conn._conn_id))
-
-    def close_all(self):
-        """关闭所有连接"""
-        with self.lock:
-            for conn in self.pool:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self.pool.clear()
-
-
-# 全局连接池实例
-_global_pool = None
-_pool_lock = threading.Lock()
-
-
-def get_hive_connection_pool(cluster_config, max_connections=4):
-    """获取或创建全局 Hive 连接池"""
-    global _global_pool
-
-    # 解析 beeline_url 获取 host 和 port
-    beeline_url = cluster_config.get('beeline_url', '')
-    # jdbc:hive2://192.168.10.102:10000/
-    host = cluster_config.get('hive_host') or 'hadoop102'
-    port = cluster_config.get('hive_port') or 10000
-
-    # 从 URL 中解析 host 和 port
-    if 'hive2://' in beeline_url:
-        parts = beeline_url.split('hive2://')[1].split('/')[0].split(':')
-        if len(parts) >= 1:
-            host = parts[0]
-        if len(parts) >= 2:
-            port = int(parts[1])
-
-    username = cluster_config.get('username', 'atguigu')
-    database = cluster_config.get('database', 'default')
-
-    with _pool_lock:
-        if _global_pool is None:
-            _global_pool = HiveConnectionPool(
-                host=host,
-                port=port,
-                username=username,
-                database=database,
-                max_connections=max_connections
-            )
-    return _global_pool
-
-
-def close_hive_connection_pool():
-    """关闭全局连接池"""
-    global _global_pool
-    with _pool_lock:
-        if _global_pool:
-            _global_pool.close_all()
-            _global_pool = None
 
 
 ARTIFACT_FIELDNAMES = [
@@ -241,9 +91,11 @@ def to_partition_dt(run_dt):
     return '{0}-{1}-{2}'.format(run_dt[0:4], run_dt[4:6], run_dt[6:8])
 
 
-def build_default_artifact_path(base_dir, data_dt, cluster_name):
+def build_default_artifact_path(base_dir, data_dt, cluster_name, folder_date=None):
     """Build the default per-cluster artifact path."""
-    return os.path.join(base_dir, data_dt, '{0}_metrics.tsv'.format(cluster_name))
+    if folder_date is None:
+        folder_date = data_dt
+    return os.path.join(base_dir, folder_date, '{0}_{1}_table_metrics.tsv'.format(data_dt, cluster_name))
 
 
 def build_default_compare_path(base_dir, data_dt):
@@ -700,11 +552,10 @@ WHERE data_dt = '{data_dt}'
 def main():
     parser = argparse.ArgumentParser(description='对比新旧集群的指标中间结果文件')
     parser.add_argument('--data-dt', required=True, help='分区日期，如 2024-01-01')
+    parser.add_argument('--cluster', required=True, help='集群名称')
     parser.add_argument('--old-artifact', help='旧集群 TSV 文件路径')
     parser.add_argument('--new-artifact', help='新集群 TSV 文件路径')
     parser.add_argument('--output-file', help='输出结果 CSV 路径')
-    parser.add_argument('--hive-table', help='Hive 表名，格式 database.table 或 table')
-    parser.add_argument('--hdfs-dir', help='HDFS 落地目录，默认读配置')
     args = parser.parse_args()
 
     config = load_env_config()
@@ -712,19 +563,21 @@ def main():
     artifact_dir = get_file_dir(config)
     run_dt = normalize_run_dt(args.data_dt)
     partition_dt = to_partition_dt(run_dt)
+    folder_date = date.today().strftime('%Y%m%d')
 
     if not args.old_artifact:
-        args.old_artifact = build_default_artifact_path(artifact_dir, run_dt, 'old')
+        args.old_artifact = build_default_artifact_path(artifact_dir, run_dt, 'old', folder_date)
     if not args.new_artifact:
-        args.new_artifact = build_default_artifact_path(artifact_dir, run_dt, 'new')
+        args.new_artifact = build_default_artifact_path(artifact_dir, run_dt, 'new', folder_date)
     if not args.output_file:
-        args.output_file = build_default_compare_path(artifact_dir, run_dt)
+        args.output_file = build_default_artifact_path(artifact_dir, run_dt, args.cluster, folder_date)
 
     print('运行日期: {0}'.format(run_dt))
     print('分区日期: {0}'.format(partition_dt))
     print('old 文件: {0}'.format(args.old_artifact))
     print('new 文件: {0}'.format(args.new_artifact))
     print('输出文件: {0}'.format(args.output_file))
+    print('等待中间结果文件生成...')
 
     wait_for_artifacts(
         [args.old_artifact, args.new_artifact],
@@ -732,6 +585,7 @@ def main():
         runtime['poll_interval_sec'],
     )
 
+    print('文件已就绪，正在读取...')
     old_rows = read_artifact_tsv(args.old_artifact)
     new_rows = read_artifact_tsv(args.new_artifact)
     if not old_rows:
@@ -740,6 +594,7 @@ def main():
         raise ValueError('new 中间结果为空: {0}'.format(args.new_artifact))
 
     compare_rows = compare_artifacts(old_rows, new_rows)
+    print('正在写入对比结果...')
     write_compare_csv(args.output_file, compare_rows)
 
     print('对比完成: {0}'.format(args.output_file))
