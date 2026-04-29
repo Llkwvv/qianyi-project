@@ -407,17 +407,6 @@ def compare_artifacts(old_rows, new_rows):
     return compare_rows
 
 
-def load_table_sql_template(template_path, database_name, table_name):
-    """Load a CREATE TABLE template and render database/table placeholders."""
-    with open(template_path, 'r', encoding='utf-8') as f:
-        sql = f.read()
-
-    return (
-        sql.replace('{{database}}', database_name)
-        .replace('{{table}}', table_name)
-    )
-
-
 def run_beeline_sql(hive_config, sql):
     """Run one beeline SQL and return the completed subprocess result."""
     cmd = build_beeline_command(hive_config, sql)
@@ -429,49 +418,10 @@ def run_beeline_sql(hive_config, sql):
     )
 
 
-def ensure_hive_table(hive_config):
-    """Create the Hive table when it does not already exist."""
-    template_path = hive_config.get('create_table_sql') or os.path.join(
-        os.path.dirname(__file__), 'hive_table.sql'
-    )
-    create_sql = load_table_sql_template(
-        template_path,
-        hive_config['database'],
-        hive_config['table'],
-    )
-    result = run_beeline_sql(hive_config, create_sql)
-    if result.returncode != 0:
-        stderr = result.stderr.decode('utf-8', errors='replace').strip()
-        raise RuntimeError('建 Hive 表失败: {0}'.format(stderr or '无错误输出'))
-
-
-def build_hdfs_target_dir(base_dir, data_dt):
-    """Build the HDFS directory used for the comparison CSV."""
-    return '{0}/{1}'.format(base_dir.rstrip('/'), data_dt)
-
-
-def run_hdfs_command(cmd):
-    """Run one HDFS CLI command and raise on failure."""
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=1800,
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.decode('utf-8', errors='replace').strip()
-        raise RuntimeError(
-            'HDFS 命令失败: {0}: {1}'.format(' '.join(cmd), stderr or '无错误输出')
-        )
-    return result
-
-
 def load_compare_csv_to_hive(csv_file, hive_config, data_dt):
     """通过INSERT方式将对比CSV写入Hive表"""
     if not os.path.exists(csv_file):
         raise ValueError('对比结果文件不存在: {0}'.format(csv_file))
-
-    ensure_hive_table(hive_config)
 
     hive_database = hive_config['database']
     hive_table = hive_config['table']
@@ -572,7 +522,7 @@ def main():
     if not args.new_artifact:
         args.new_artifact = build_default_artifact_path(artifact_dir, run_dt, 'new', folder_date)
     if not args.output_file:
-        args.output_file = build_default_compare_path(artifact_dir, run_dt)
+        args.output_file = build_default_compare_path(artifact_dir, run_dt, folder_date)
 
     print('运行日期: {0}'.format(run_dt))
     print('分区日期: {0}'.format(partition_dt))
@@ -603,21 +553,6 @@ def main():
     print('共输出 {0} 条结果'.format(len(compare_rows)))
 
     hive_config = config.get('hive', {}).copy()
-    hive_config.setdefault('database', 'default')
-    hive_config.setdefault('table', 'metric_comparison')
-    hive_config.setdefault('beeline_cmd', '/home/lkw/apache-hive-3.1.3-bin/bin/beeline')
-    hive_config.setdefault('beeline_url', 'jdbc:hive2://172.20.10.6:10000/')
-    hive_config.setdefault('username', 'atguigu')
-    hive_config.setdefault('use_ssh', False)
-    hive_config.setdefault('hdfs_dir', '/home/lkw/qianyi-project/old/sumamount/hdfs_tmp')
-
-    if args.hive_table:
-        if '.' in args.hive_table:
-            hive_config['database'], hive_config['table'] = args.hive_table.split('.', 1)
-        else:
-            hive_config['table'] = args.hive_table
-    if args.hdfs_dir:
-        hive_config['hdfs_dir'] = args.hdfs_dir
 
     print(
         '准备写入 Hive: {0}.{1}, 分区 data_dt={2}'.format(
