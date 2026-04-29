@@ -35,6 +35,7 @@ COMPARE_FIELDNAMES = [
     'new_value',
     'diff_value',
     'etl_tm',
+    'data_dt',
 ]
 
 BASE_RESULT_COLUMNS = ['table_name', 'data_dt', 'partition_col']
@@ -550,6 +551,9 @@ def main():
         raise ValueError('new 中间结果为空: {0}'.format(args.new_artifact))
 
     compare_rows = compare_artifacts(old_rows, new_rows)
+    # 添加 data_dt 分区字段
+    for row in compare_rows:
+        row['data_dt'] = partition_dt
     print('正在写入对比结果...')
     write_compare_csv(args.output_file, compare_rows)
 
